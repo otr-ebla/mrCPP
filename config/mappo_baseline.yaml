@@ -1,0 +1,57 @@
+env:
+  num_robots: 3
+  num_humans: 0          # no dynamic obstacles in this baseline
+  k_teammates: 2         # how many closest teammates each robot observes
+  m_humans: 1            # observation slots for humans (zero-padded when 0 humans)
+  n_rays: 36             # lidar rays, one every 10 degrees
+  max_lidar_range: 5.0   # metres
+  cell_size: 0.5         # metres per grid cell → 24×16 = 384 cells for 12×8 m map
+  sensing_radius: 5.0    # radius within which teammates / humans are visible
+  robot_radius: 0.20     # metres, used for collision and spawn clearance
+  dt: 0.1                # physics time step (seconds)
+  max_steps: 500         # steps before truncation
+  v_max: 1.0             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
+  omega_max: 1.0         # max angular velocity (rad/s)
+  # soft collision: robots freeze for one step and receive a per-agent kappa penalty,
+  # episode continues — avoids prematurely ending good coverage runs due to a brief
+  # coordination lapse while robots are still learning to avoid each other
+  terminate_on_collision: false
+  # local coverage patch: gives actors a birds-eye view of nearby coverage without
+  # breaking decentralised execution — this is the key driver of efficient coverage
+  use_local_coverage_obs: true
+  local_coverage_size: 7    # 7×7 = 49 binary cells centred on the robot
+  # reward weights
+  alpha: 10.0            # new cells covered
+  beta: 0.1              # redundant cell visits
+  kappa: 20.0            # hard collision penalty (per colliding agent only)
+  tau: 0.01              # per-step time penalty
+  # inter-robot proximity penalty: continuous soft repulsion before hard collision
+  # fires when robots are within safe_dist_factor × robot_radius of each other
+  psi: 1.5               # proximity penalty weight
+  safe_dist_factor: 5.0  # safe_dist = 5 × 0.20 m = 1.0 m
+  # room completion bonus: fires once per room when coverage ≥ threshold
+  # teaches robots to finish a room before moving to the next one
+  room_completion_bonus: 50.0
+  room_completion_threshold: 0.85
+
+model:
+  hidden_size: 128       # MLP feature extractor width
+  gru_hidden: 128        # GRU hidden state size
+  critic_hidden: 256     # centralised critic MLP width
+
+train:
+  num_envs: 8            # parallel environment workers (set to your CPU core count)
+  rollout_steps: 256     # T — steps per env per update; total = num_envs × T
+  total_updates: 3000    # 3000 × 8 × 256 = 6.1M environment steps
+  log_interval: 10       # print every N updates
+  save_interval: 100     # save checkpoint every N updates
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr_actor: 3.0e-4
+  lr_critic: 1.0e-3
+  lr_decay: true         # linear decay to 0 over training
+  clip_eps: 0.2
+  entropy_coef: 0.05     # higher entropy essential while robots are learning wall avoidance
+  max_grad_norm: 10.0
+  n_epochs: 10           # PPO epochs per update
+  normalize_obs: true    # RunningMeanStd normalisation for stable training
