@@ -86,5 +86,4 @@ architectural ambition:
 
 - All modeling and training code (encoder, Mamba SSM world model, actor, critic,
   imagination rollouts) must be implemented in **JAX**, targeting **CUDA** execution.
-- Code must be lean: no unnecessary comments, no dead code, no speculative
-  abstractions ahead of what a given experiment needs.
+
