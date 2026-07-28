@@ -42,7 +42,6 @@ The project evaluates architectures in increasing order of complexity:
 ## ⚙️ Implementation Constraints
 
 * **Framework:** 100% implemented in **JAX**, optimized for high-performance **CUDA** execution.
-* **Design Philosophy:** Lean, modular codebase—no unnecessary comments, dead code, or speculative abstractions.
 
 ---
 
