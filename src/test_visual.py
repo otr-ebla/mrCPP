@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
-"""Visualise a trained MAPPO policy in real time using pygame.
+"""Visualise a trained MAPPO policy in real time using pygame (JAX).
 
-Usage (from internal-simple-project/):
-    python src/test_visual.py
-    python src/test_visual.py --checkpoint checkpoints/best_policy.pt --episodes 10
+Usage (from the project root):
+    python -m src.test_visual
+    python -m src.test_visual --checkpoint checkpoints/checkpoint_final.pkl --episodes 10
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import pickle
 import sys
 
 import numpy as np
-import torch
 import pygame
 
-# Ensure the project root (internal-simple-project/) is on sys.path so that
-# "from src.xxx import ..." works regardless of where the script is invoked.
+# Ensure the project root is on sys.path so that "from src.xxx import ..."
+# works regardless of where the script is invoked.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, '..'))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import jax
+import jax.numpy as jnp
+
+from src.algorithms.mappo import RunningMeanStd, rms_normalize
 from src.envs.coverage_vector_env import MultiRobotCoverageEnv
-from src.models.actor_critic_mlp import Actor
+from src.models.actor_critic import Actor
 from src.utils.config_parser import load_config
-from src.train_simple import RunningMeanStd
+from src.utils.jax_device import describe, select_device
 
 # ---------------------------------------------------------------------------
 # Rendering constants
@@ -36,7 +40,7 @@ MARGIN     = 40   # pixel border around the map
 HUD_HEIGHT = 50   # pixels for the stats bar at the bottom
 FPS        = 30
 
-# One colour per robot (cycles if more than 3)
+# One colour per robot (cycles if more than 4)
 _ROBOT_COLORS = [
     (220,  60,  60),
     ( 60, 120, 220),
@@ -46,12 +50,14 @@ _ROBOT_COLORS = [
 
 COLORS = {
     'bg':        (240, 240, 235),
-    'covered':   (140, 220, 140),
-    'uncovered': (215, 215, 210),
+    'covered':     (140, 220, 140),
+    'uncovered':   (215, 215, 210),
+    'unreachable': (170, 170, 165),
     'wall':      ( 55,  55,  55),
     'border':    ( 30,  30,  30),
     'grid':      (180, 180, 175),
     'lidar':     (255, 165,   0),
+    'dead':      (120, 120, 120),
     'hud_bg':    ( 25,  25,  25),
     'hud_text':  (230, 230, 230),
 }
@@ -63,9 +69,44 @@ def _to_px(x: float, y: float, map_h: float) -> tuple[int, int]:
             int((map_h - y) * SCALE) + MARGIN)
 
 
+def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
+    """Pull the arrays needed for one frame back to the host in one go.
+
+    Device→host transfers are the only per-frame cost of rendering, so every
+    field is fetched with a single `jax.device_get` on a packed tuple.
+    """
+    info = env.get_info(state)
+    payload = (
+        state.robot_positions,
+        state.robot_headings,
+        state.coverage_grid,
+        state.robot_alive,
+        info['step'],
+        info['coverage_ratio'],
+        info['covered_cells'],
+        info['total_cells'],
+        env._cast_lidar_all(state.robot_positions, state.robot_headings)
+        if want_lidar else jnp.zeros((0,), jnp.float32),
+    )
+    pos, hdg, grid, alive, step, cov_ratio, covered, total, lidar = jax.device_get(payload)
+    return {
+        'positions':      np.asarray(pos),
+        'headings':       np.asarray(hdg),
+        'coverage_grid':  np.asarray(grid),
+        'alive':          np.asarray(alive),
+        'step':           int(step),
+        'coverage_ratio': float(cov_ratio),
+        'covered_cells':  int(covered),
+        'total_cells':    int(total),
+        'lidar':          np.asarray(lidar),
+    }
+
+
 def _draw_frame(
     surface: pygame.Surface,
     env: MultiRobotCoverageEnv,
+    walls: np.ndarray,
+    snap: dict,
     font: pygame.font.Font,
     ep_reward: float,
     show_lidar: bool,
@@ -77,10 +118,18 @@ def _draw_frame(
     surface.fill(COLORS['bg'])
 
     # -- Coverage cells --
+    # Unreachable cells are drawn apart from pending ones: they are excluded
+    # from the coverage denominator, so leaving them "uncovered" would suggest
+    # work that can never be done.
     cell_px = int(cs * SCALE)
+    grid = snap['coverage_grid']
+    free = env.free_mask_np
     for row in range(env.grid_h):
         for col in range(env.grid_w):
-            color = COLORS['covered'] if env.coverage_grid[row, col] else COLORS['uncovered']
+            if free[row, col] == 0.0:
+                color = COLORS['unreachable']
+            else:
+                color = COLORS['covered'] if grid[row, col] > 0.0 else COLORS['uncovered']
             px, py = _to_px(col * cs, (row + 1) * cs, mh)
             pygame.draw.rect(surface, color, pygame.Rect(px, py, cell_px, cell_px))
 
@@ -95,7 +144,7 @@ def _draw_frame(
         pygame.draw.line(surface, COLORS['grid'], (MARGIN, y), (MARGIN + map_px_w, y))
 
     # -- Walls --
-    for x0, y0, x1, y1 in env.walls:
+    for x0, y0, x1, y1 in walls:
         px, py = _to_px(x0, y1, mh)
         w = int((x1 - x0) * SCALE)
         h = int((y1 - y0) * SCALE)
@@ -104,32 +153,33 @@ def _draw_frame(
     # -- Map border --
     pygame.draw.rect(
         surface, COLORS['border'],
-        pygame.Rect(MARGIN, MARGIN, int(mw * SCALE), int(mh * SCALE)),
+        pygame.Rect(MARGIN, MARGIN, map_px_w, map_px_h),
         2,
     )
 
+    positions = snap['positions']
+    headings  = snap['headings']
+
     # -- Lidar rays (toggle with 'L') --
-    if show_lidar:
+    if show_lidar and snap['lidar'].size:
+        angles_rel = np.linspace(0.0, 2.0 * np.pi, env.n_rays, endpoint=False)
         for i in range(env.num_robots):
-            pos       = env.robot_positions[i]
-            hdg       = env.robot_headings[i]
-            other_pos = np.delete(env.robot_positions, i, axis=0)
-            ranges    = env._cast_lidar(pos, hdg, other_pos)   # normalised [0, 1]
-            angles    = hdg + np.linspace(0.0, 2.0 * np.pi, env.n_rays, endpoint=False)
-            cx, cy    = _to_px(pos[0], pos[1], mh)
-            for ang, r in zip(angles, ranges):
-                dist = r * env.max_lidar_range
-                ex   = pos[0] + dist * np.cos(ang)
-                ey   = pos[1] + dist * np.sin(ang)
-                ex_px, ey_px = _to_px(ex, ey, mh)
-                pygame.draw.line(surface, COLORS['lidar'], (cx, cy), (ex_px, ey_px), 1)
+            pos    = positions[i]
+            angles = headings[i] + angles_rel
+            dists  = snap['lidar'][i] * env.max_lidar_range   # stored normalised
+            cx, cy = _to_px(pos[0], pos[1], mh)
+            ex = pos[0] + dists * np.cos(angles)
+            ey = pos[1] + dists * np.sin(angles)
+            for x, y in zip(ex, ey):
+                pygame.draw.line(surface, COLORS['lidar'], (cx, cy), _to_px(x, y, mh), 1)
 
     # -- Robots --
     r_px = max(5, int(env.robot_radius * SCALE))
     for i in range(env.num_robots):
-        cx, cy = _to_px(env.robot_positions[i, 0], env.robot_positions[i, 1], mh)
-        hdg     = env.robot_headings[i]
-        color   = _ROBOT_COLORS[i % len(_ROBOT_COLORS)]
+        cx, cy = _to_px(positions[i, 0], positions[i, 1], mh)
+        hdg    = headings[i]
+        color  = (_ROBOT_COLORS[i % len(_ROBOT_COLORS)] if snap['alive'][i]
+                  else COLORS['dead'])
         pygame.draw.circle(surface, color, (cx, cy), r_px)
         tip_x = cx + int(r_px * 1.8 * np.cos(hdg))
         tip_y = cy - int(r_px * 1.8 * np.sin(hdg))
@@ -139,10 +189,9 @@ def _draw_frame(
         surface.blit(lbl, (cx - lbl.get_width() // 2, cy - lbl.get_height() // 2))
 
     # -- HUD --
-    info = env._get_info()
-    text = (f"  Step {info['step']:4d}/{env.max_steps}  |  "
-            f"Coverage {info['coverage_ratio']:.1%} "
-            f"({info['covered_cells']}/{info['total_cells']})  |  "
+    text = (f"  Step {snap['step']:4d}/{env.max_steps}  |  "
+            f"Coverage {snap['coverage_ratio']:.1%} "
+            f"({snap['covered_cells']}/{snap['total_cells']})  |  "
             f"Ep Reward {ep_reward:8.2f}  |  "
             f"[ESC] quit  [R] reset  [L] lidar")
     win_h = surface.get_height()
@@ -154,22 +203,40 @@ def _draw_frame(
     surface.blit(rendered, (8, win_h - HUD_HEIGHT + (HUD_HEIGHT - rendered.get_height()) // 2))
 
 
-@torch.no_grad()
+def _build_policy_fn(env: MultiRobotCoverageEnv, actor: Actor):
+    """One jitted call per frame: normalise obs → greedy action → env step.
+
+    Fusing the policy and the environment transition keeps a single device
+    round-trip per rendered frame; only the render snapshot comes back.
+    """
+
+    @jax.jit
+    def policy_step(params, rms, state, obs):
+        obs_n = rms_normalize(rms, obs) if rms is not None else obs
+        mean, _ = actor.apply(params, obs_n)
+        action = jnp.tanh(mean)                       # deterministic
+        next_state, rewards, terminated, truncated = env.step(state, action)
+        return next_state, env.get_obs(next_state), rewards, terminated, truncated
+
+    return policy_step
+
+
 def run_episode(
     env: MultiRobotCoverageEnv,
-    actor: Actor,
+    policy_step,
+    params,
     obs_rms: RunningMeanStd | None,
-    device: torch.device,
+    key: jax.Array,
     surface: pygame.Surface,
     clock: pygame.time.Clock,
     font: pygame.font.Font,
+    walls: np.ndarray,
     fps: int,
     view_state: dict,
 ) -> float | None:
-    """Run one episode. Returns total reward, or None if user quit."""
-    obs, _ = env.reset()
-    N  = env.num_robots
-    hx = actor.init_hidden(N, device=str(device))
+    """Run one episode. Returns total reward, or None if the user quit."""
+    state = env.reset(key)
+    obs   = env.get_obs(state)
 
     ep_reward = 0.0
 
@@ -185,69 +252,102 @@ def run_episode(
                 if event.key == pygame.K_l:
                     view_state['show_lidar'] = not view_state['show_lidar']
 
-        obs_in = obs_rms.normalize(obs) if obs_rms is not None else obs
-        obs_t  = torch.from_numpy(obs_in).float().to(device)   # (N, obs_dim)
-        mean, _, hx = actor(obs_t, hx)
-        actions = torch.tanh(mean).cpu().numpy()               # deterministic
+        state, obs, rewards, terminated, truncated = policy_step(
+            params, obs_rms, state, obs
+        )
+        ep_reward += float(jnp.mean(rewards))
 
-        obs, rewards, terminated, truncated, _ = env.step(actions)
-        ep_reward += float(rewards.mean())
-
-        _draw_frame(surface, env, font, ep_reward, view_state['show_lidar'])
+        snap = _snapshot(env, state, view_state['show_lidar'])
+        _draw_frame(surface, env, walls, snap, font, ep_reward, view_state['show_lidar'])
         pygame.display.flip()
         clock.tick(fps)
 
-        if terminated or truncated:
+        if bool(terminated) or bool(truncated):
             return ep_reward
+
+
+def _load_checkpoint(path: str, device: jax.Device) -> tuple[dict, RunningMeanStd | None, int]:
+    """Read a JAX training checkpoint and place its arrays on `device`."""
+    try:
+        with open(path, 'rb') as f:
+            ckpt = pickle.load(f)
+    except (pickle.UnpicklingError, UnicodeDecodeError, EOFError) as exc:
+        raise SystemExit(
+            f"Cannot read '{path}' as a JAX checkpoint ({exc}).\n"
+            "PyTorch-era '.pt' checkpoints are not loadable by the JAX policy: "
+            "retrain with `python -m src.train_simple` to produce "
+            "'checkpoints/checkpoint_final.pkl'."
+        ) from exc
+
+    if 'actor_params' not in ckpt:
+        raise SystemExit(
+            f"'{path}' has no 'actor_params' entry — it is not a JAX checkpoint "
+            "written by src.train_simple."
+        )
+
+    params = jax.device_put(ckpt['actor_params'], device)
+    rms = None
+    if ckpt.get('obs_rms') is not None:
+        rms = RunningMeanStd(*jax.device_put(tuple(ckpt['obs_rms']), device))
+    return params, rms, int(ckpt.get('update', 0))
 
 
 def main() -> None:
     _default_cfg  = os.path.join(_ROOT, 'config', 'mappo_baseline.yaml')
-    _default_ckpt = os.path.join(_ROOT, 'checkpoints', 'best_policy.pt')
+    _default_ckpt = os.path.join(_ROOT, 'checkpoints', 'checkpoint_final.pkl')
 
     parser = argparse.ArgumentParser(description='Visualise trained MAPPO policy with pygame')
     parser.add_argument('--checkpoint', default=_default_ckpt,
-                        help='Path to .pt checkpoint (default: checkpoints/best_policy.pt)')
+                        help='Path to .pkl checkpoint (default: checkpoints/checkpoint_final.pkl)')
     parser.add_argument('--config',     default=_default_cfg,
                         help='Path to YAML config file')
     parser.add_argument('--episodes',   type=int, default=0,
                         help='Episodes to run; 0 = loop forever (default: 0)')
     parser.add_argument('--fps',        type=int, default=FPS,
                         help=f'Rendering FPS (default: {FPS})')
+    parser.add_argument('--seed',       type=int, default=0,
+                        help='PRNG seed for episode resets (default: 0)')
     parser.add_argument('--no-obs-norm', action='store_true',
                         help='Disable observation normalisation')
+    parser.add_argument('--backend',    default='cpu',
+                        choices=['auto', 'metal', 'cuda', 'gpu', 'cpu'],
+                        help='JAX backend. Default "cpu": a single-env rollout is '
+                             'tiny, so the CPU beats accelerator launch overhead')
     args = parser.parse_args()
 
     config    = load_config(args.config)
     env_cfg   = config.get('env',   {})
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
-    device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    env        = MultiRobotCoverageEnv(env_cfg)
-    obs_dim    = env.obs_dim
-    action_dim = 2
-    N          = env.num_robots
+    # Must run before any array is created so implicit placement follows it.
+    device = select_device(None if args.backend == 'auto' else args.backend)
+    print(f"Device: {describe(device)}")
+
+    env   = MultiRobotCoverageEnv(env_cfg)
+    walls = np.asarray(env.walls)
 
     actor = Actor(
-        obs_dim, action_dim,
-        model_cfg.get('hidden_size', 128),
-        model_cfg.get('gru_hidden',  128),
-    ).to(device)
-    actor.eval()
+        action_dim=env.action_dim,
+        vec_dim=env.obs_vec_dim,
+        n_rays=env.n_rays,
+        patch_dim=env.patch_dim,
+        lidar_embed=model_cfg.get('lidar_embed',  64),
+        hidden_size=model_cfg.get('hidden_size', 128),
+    )
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    actor.load_state_dict(ckpt['actor_state'])
-    print(f"Loaded: {args.checkpoint}  (update {ckpt.get('update', '?')})")
+    params, obs_rms, update = _load_checkpoint(args.checkpoint, device)
+    print(f"Loaded: {args.checkpoint}  (update {update})")
 
-    obs_rms = None
-    if not args.no_obs_norm and train_cfg.get('normalize_obs', True):
-        if 'obs_rms' in ckpt:
-            obs_rms = RunningMeanStd(shape=(obs_dim,))
-            obs_rms.load_state_dict(ckpt['obs_rms'])
-            print("Observation normalisation: loaded from checkpoint.")
-        else:
-            print("Warning: checkpoint has no obs_rms — running without normalisation.")
+    if args.no_obs_norm or not train_cfg.get('normalize_obs', True):
+        obs_rms = None
+        print("Observation normalisation: disabled.")
+    elif obs_rms is None:
+        print("Warning: checkpoint has no obs_rms — running without normalisation.")
+    else:
+        print("Observation normalisation: loaded from checkpoint.")
+
+    policy_step = _build_policy_fn(env, actor)
 
     # -- Pygame setup --
     mw    = env.map_layout.width
@@ -262,12 +362,15 @@ def main() -> None:
     font  = pygame.font.SysFont('monospace', 15)
 
     view_state = {'show_lidar': False}
+    key = jax.random.PRNGKey(args.seed)
 
     ep_num = 0
     try:
         while args.episodes == 0 or ep_num < args.episodes:
+            key, ep_key = jax.random.split(key)
             print(f"Episode {ep_num + 1} ...", end='', flush=True)
-            ret = run_episode(env, actor, obs_rms, device, surface, clock, font, args.fps, view_state)
+            ret = run_episode(env, policy_step, params, obs_rms, ep_key,
+                              surface, clock, font, walls, args.fps, view_state)
             if ret is None:
                 print("  (quit)")
                 break

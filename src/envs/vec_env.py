@@ -59,12 +59,32 @@ class VecEnv:
         return self.env.obs_dim
 
     @property
-    def state_dim(self) -> int:
-        return self.env.state_dim
-
-    @property
     def action_dim(self) -> int:
         return self.env.action_dim
+
+    @property
+    def norm_dim(self) -> int:
+        return self.env.norm_dim
+
+    @property
+    def grid_h(self) -> int:
+        return self.env.grid_h
+
+    @property
+    def grid_w(self) -> int:
+        return self.env.grid_w
+
+    @property
+    def critic_channels(self) -> int:
+        return self.env.critic_channels
+
+    @property
+    def critic_vec_dim(self) -> int:
+        return self.env.critic_vec_dim
+
+    def critic_inputs(self, gstate):
+        """Per-agent critic tensors; broadcasts over the leading env axis."""
+        return self.env.critic_inputs(gstate)
 
     # ------------------------------------------------------------------
 
@@ -87,18 +107,25 @@ class VecEnv:
         state   : batched EnvState — already reset where the episode ended
         obs     : (E, N, obs_dim)  — from new episode when done
         rewards : (E, N)
-        terms   : (E,) bool        — True on hard termination (collision only)
+        terms   : (E,) bool        — True on hard termination (collision or a
+                                     fully covered map)
         dones   : (E,) bool        — True on terminated OR truncated
-        infos   : dict of (E, ...) arrays
-        gstates : (E, state_dim)   — from new episode when done
+        infos   : dict of (E, ...) arrays — from the episode that just stepped,
+                  i.e. pre-reset, so terminal coverage stays visible
+        gstates : GlobalState with leading (E,) — from new episode when done
 
-        Use `terms` for GAE bootstrap masking (collision = no bootstrap).
-        Use `dones` for hidden-state reset (any episode end resets the GRU).
+        Use `terms` for GAE bootstrap masking (termination = no bootstrap).
         """
 
         def one(s: EnvState, a: jax.Array):
             s, reward, term, trunc = self.env.step(s, a)
             done = term | trunc
+
+            # Diagnostics describe the step just taken, like `reward`, so they
+            # are read before the auto-reset. Reading them afterwards would
+            # replace the final coverage of a finished episode with the fresh
+            # episode's empty grid, making end-of-episode coverage unobservable.
+            info = self.env.get_info(s)
 
             key, reset_key = jax.random.split(s.key)
             fresh = self.env.reset(reset_key)
@@ -107,6 +134,6 @@ class VecEnv:
             )
 
             return (s, self.env.get_obs(s), reward, term, done,
-                    self.env.get_info(s), self.env.get_global_state(s))
+                    info, self.env.get_global_state(s))
 
         return jax.vmap(one)(state, actions)

@@ -5,28 +5,41 @@ The environment is a pure function of an immutable `EnvState` pytree, so
 `reset` / `step` / `get_obs` can be jitted, vmapped over parallel environments,
 and scanned over time without leaving the accelerator.
 
-Observation per robot (o_i):
+Observation per robot (o_i), decentralised execution:
     [v_i, w_i,  rel_teammates (k*2),  rel_humans (m*2),  lidar (n_rays),
      local_coverage (L*L, optional)]
+
+The binary local-coverage patch is deliberately the tail of the vector: it is
+the only non-continuous block, so callers can normalise `obs[..., :norm_dim]`
+with a single slice and leave the binary cells untouched.
 
 Lidar detects both walls and other robots as obstacles, giving a direct
 proximity signal identical to wall avoidance so agents can learn inter-robot
 collision avoidance with the same mechanism.
 
-Centralised critic state (s):
-    [robot_positions (N*2), robot_headings (N), human_positions (M*2),
-     coverage_grid (H*W)]
+Centralised critic state (`GlobalState`), training only:
+    coverage   (H, W)      team coverage grid
+    occupancy  (N, H, W)   one-hot cell of each robot
+    kinematics (N, 6)      normalised pose + commanded velocities
+`critic_inputs` expands it into the per-agent multi-channel tensor
+[walls, coverage, self, teammates] plus the joint kinematic vector.
 
 Actions: (N, 2) in [-1, 1].
     action[:,0] -> linear  velocity in [0, v_max]   (remapped from [-1,1])
     action[:,1] -> angular velocity in [-omega_max, omega_max]
 
-Reward (per-agent):
-    team part  :  alpha*dn  -  beta*rho  -  tau  +  room_bonus
-    agent part :  -  kappa*collision_i  -  psi*proximity_i
+Reward (difference reward, per agent):
+    R_i = alpha*new_cell_i - beta*redundant_i - tau - kappa*collided_i
+          - psi*proximity_i + team_bonus
+Only the robot that flips a cell from unvisited to visited is paid for it, so a
+robot that stands still while the team works collects nothing. `team_bonus`
+carries the two cooperative events (room completion, full coverage) that no
+single agent can be credited for.
 """
 
 from __future__ import annotations
+
+from collections import deque
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +65,20 @@ class EnvState:
     robot_alive:      jax.Array   # (N,)     bool
     step_count:       jax.Array   # ()       int32
     key:              jax.Array   # PRNG key carried for auto-reset
+
+
+@struct.dataclass
+class GlobalState:
+    """Centralised critic state, kept as small spatial tensors.
+
+    The static wall map is *not* stored here: it is identical in every
+    transition, so `critic_inputs` broadcasts it from the environment instead of
+    paying for it once per step in the rollout buffer.
+    """
+
+    coverage:   jax.Array   # (H, W)     float32
+    occupancy:  jax.Array   # (N, H, W)  float32, one-hot per robot
+    kinematics: jax.Array   # (N, 6)     float32, normalised
 
 
 class MultiRobotCoverageEnv:
@@ -80,30 +107,39 @@ class MultiRobotCoverageEnv:
         self.omega_max       = float(cfg.get('omega_max',       1.0))
 
         # -- Collision handling --
-        # When True, a robot that collides (wall or robot-robot) dies: it
-        # freezes permanently at its last position for the rest of the episode
-        # and stops receiving any reward from that point on. Other (still
-        # alive) robots are unaffected and keep the episode running until
-        # truncation or until every robot has died.
+        # When True, a collision is fatal for the whole team: as soon as any
+        # robot hits a wall or another robot the episode terminates for all
+        # robots on that same step. When False, collisions are soft — the
+        # offender is blocked for one step, pays the kappa penalty and the
+        # episode continues. Soft is the default: under hard termination the
+        # early random policy ends every episode after a few dozen steps, so the
+        # team never collects the experience needed to reach the far rooms.
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
 
         # -- Local coverage patch in actor observation --
         self.use_local_coverage_obs = bool(cfg.get('use_local_coverage_obs', True))
-        self.local_coverage_size    = int(cfg.get('local_coverage_size',    7))
+        self.local_coverage_size    = int(cfg.get('local_coverage_size',    5))
 
         # -- Reward weights --
         self.alpha = float(cfg.get('alpha', 10.0))
-        self.beta  = float(cfg.get('beta',  0.1))
+        self.beta  = float(cfg.get('beta',   0.005))
         self.kappa = float(cfg.get('kappa', 20.0))
-        self.tau   = float(cfg.get('tau',   0.01))
+        self.tau   = float(cfg.get('tau',    0.05))
+        if self.beta >= self.tau:
+            raise ValueError(
+                f"redundancy weight beta={self.beta} must be strictly smaller than "
+                f"the time penalty tau={self.tau}; otherwise standing still is "
+                "cheaper than driving across already-covered cells."
+            )
 
         # -- Proximity penalty: soft repulsion before hard collision --
         self.psi        = float(cfg.get('psi',              1.5))
         self._safe_dist = float(cfg.get('safe_dist_factor', 5.0)) * self.robot_radius
 
-        # -- Room completion bonus --
+        # -- Cooperative bonuses --
         self.room_completion_bonus     = float(cfg.get('room_completion_bonus',     50.0))
         self.room_completion_threshold = float(cfg.get('room_completion_threshold', 0.85))
+        self.completion_bonus          = float(cfg.get('completion_bonus',         200.0))
 
         # -- Map --
         self.map_layout = IndoorMapLayout()
@@ -117,6 +153,20 @@ class MultiRobotCoverageEnv:
         # -- Grid --
         self.grid_w = int(np.ceil(self.map_layout.width  / self.cell_size))
         self.grid_h = int(np.ceil(self.map_layout.height / self.cell_size))
+        self.num_cells = self.grid_h * self.grid_w
+
+        # -- Free space: the only cells that count towards coverage --
+        # Computed once here (the map is static) rather than per reset.
+        free_np = self._compute_free_mask()                      # (H, W) float32
+        self.free_mask_np = free_np                              # host copy, for rendering
+        self.free_mask   = jnp.asarray(free_np)
+        self._free_flat  = jnp.asarray(free_np.ravel())
+        self.free_total  = float(free_np.sum())
+        # Obstacle channel for the critic and "nothing to do here" marker for the
+        # actor's local patch.
+        self.wall_grid   = jnp.asarray(1.0 - free_np)
+        if self.free_total < self.num_robots:
+            raise RuntimeError("Free space is too small for the requested robot count.")
 
         # -- Room definitions: 5 bounding boxes matching the map layout --
         outer_t = 0.20
@@ -131,11 +181,12 @@ class MultiRobotCoverageEnv:
             (x_right + inner_t/2, outer_t,          W       - outer_t,   4.0 - inner_t/2),
             (x_right + inner_t/2, 4.0 + inner_t/2,  W       - outer_t,   H   - outer_t),
         ]
-        xs = np.arange(self.grid_w) * self.cell_size + self.cell_size * 0.5
-        ys = np.arange(self.grid_h) * self.cell_size + self.cell_size * 0.5
-        xv, yv = np.meshgrid(xs, ys)
+        xv, yv = self._cell_centers()
+        # Intersecting each room box with the free mask is what makes the 0.85
+        # threshold reachable: counting walled cells in the denominator caps
+        # every room below it.
         masks_np = np.stack([
-            (xv >= rx0) & (xv < rx1) & (yv >= ry0) & (yv < ry1)
+            ((xv >= rx0) & (xv < rx1) & (yv >= ry0) & (yv < ry1)) & (free_np > 0.0)
             for rx0, ry0, rx1, ry1 in self._rooms
         ]).astype(np.float32)                      # (R, H, W)
         self.num_rooms   = masks_np.shape[0]
@@ -143,27 +194,28 @@ class MultiRobotCoverageEnv:
         self.room_totals = jnp.asarray(masks_np.sum(axis=(1, 2)))
 
         # -- Derived dims --
-        local_cov_dim  = self.local_coverage_size ** 2 if self.use_local_coverage_obs else 0
-        self.obs_dim   = (2 + self.k_teammates * 2 + self.m_humans * 2
-                          + self.n_rays + local_cov_dim)
-        self.state_dim = (self.num_robots * 3
-                          + self.num_humans * 2
-                          + self.grid_w * self.grid_h)
-        self.action_dim = 2
+        # Layout: [continuous block | lidar | binary patch]. `norm_dim` is the
+        # length of the prefix that observation normalisation may touch.
+        self.obs_vec_dim   = 2 + self.k_teammates * 2 + self.m_humans * 2
+        self.patch_dim     = (self.local_coverage_size ** 2
+                              if self.use_local_coverage_obs else 0)
+        self.norm_dim      = self.obs_vec_dim + self.n_rays
+        self.obs_dim       = self.norm_dim + self.patch_dim
+        self.action_dim    = 2
+        # Critic input shapes: [walls, coverage, self, teammates] per agent.
+        self.critic_channels = 4
+        self.critic_vec_dim  = 6 + 6 * self.num_robots
 
         # -- Lidar ray angles (relative to robot heading) --
         self._ray_angles = jnp.asarray(
             np.linspace(0.0, _TWO_PI, self.n_rays, endpoint=False, dtype=np.float32)
         )
 
-        # -- Spawn candidates --
-        self._spawn_candidates = jnp.asarray(self._precompute_spawn_candidates())
+        # -- Spawn candidates: the free cell centres, so a robot can never start
+        #    inside a pocket that is walled off from the coverable region --
+        centers = np.stack([xv.ravel(), yv.ravel()], axis=1).astype(np.float32)
+        self._spawn_candidates = jnp.asarray(centers[free_np.ravel() > 0.0])
         self._num_candidates   = int(self._spawn_candidates.shape[0])
-        if self._num_candidates < self.num_robots:
-            raise RuntimeError(
-                f"Not enough spawn candidates ({self._num_candidates}) "
-                f"for {self.num_robots} robots."
-            )
         # Candidates sit on a `cell_size` lattice, so any two distinct candidates
         # are already at least `cell_size` apart. When that exceeds the required
         # clearance a random subset is always valid and the greedy scan is skipped.
@@ -174,22 +226,60 @@ class MultiRobotCoverageEnv:
         self._k_eff = min(self.k_teammates, max(self.num_robots - 1, 0))
         self._m_eff = min(self.m_humans, self.num_humans)
 
+        self._robot_ids = jnp.arange(self.num_robots, dtype=jnp.int32)
+
     # ------------------------------------------------------------------
     # Static precomputation (numpy, runs once at construction)
     # ------------------------------------------------------------------
 
-    def _precompute_spawn_candidates(self) -> np.ndarray:
-        xs = np.arange(self.cell_size, self.map_layout.width,  self.cell_size)
-        ys = np.arange(self.cell_size, self.map_layout.height, self.cell_size)
-        xv, yv = np.meshgrid(xs, ys)
-        cands = np.stack([xv.ravel(), yv.ravel()], axis=1).astype(np.float32)
+    def _cell_centers(self) -> tuple[np.ndarray, np.ndarray]:
+        xs = (np.arange(self.grid_w) + 0.5) * self.cell_size
+        ys = (np.arange(self.grid_h) + 0.5) * self.cell_size
+        return np.meshgrid(xs, ys)
+
+    def _compute_free_mask(self) -> np.ndarray:
+        """Cells a robot centre can occupy AND reach. Returns (H, W) float32.
+
+        A cell is coverable only if the robot body fits at its centre and the
+        cell is connected to the rest of the map: a geometrically clear cell
+        sealed behind walls would otherwise sit in the denominator forever and
+        make 100% coverage unattainable.
+        """
+        xv, yv = self._cell_centers()
+        centers = np.stack([xv.ravel(), yv.ravel()], axis=1).astype(np.float32)
 
         walls = np.asarray(self.map_layout.get_walls(), dtype=np.float32)
-        cx = np.clip(cands[:, 0:1], walls[None, :, 0], walls[None, :, 2])
-        cy = np.clip(cands[:, 1:2], walls[None, :, 1], walls[None, :, 3])
-        d2 = (cands[:, 0:1] - cx) ** 2 + (cands[:, 1:2] - cy) ** 2
-        free = ~np.any(d2 < self.robot_radius ** 2, axis=1)
-        return cands[free]
+        cx = np.clip(centers[:, 0:1], walls[None, :, 0], walls[None, :, 2])
+        cy = np.clip(centers[:, 1:2], walls[None, :, 1], walls[None, :, 3])
+        d2 = (centers[:, 0:1] - cx) ** 2 + (centers[:, 1:2] - cy) ** 2
+        clear = (~np.any(d2 < self.robot_radius ** 2, axis=1))
+        clear = clear.reshape(self.grid_h, self.grid_w)
+
+        # Largest 4-connected component of `clear`. Runs once at construction on
+        # a few hundred cells, so a plain BFS is cheaper than pulling in scipy.
+        seen = np.zeros_like(clear)
+        best = np.zeros_like(clear)
+        best_size = 0
+        for r0 in range(self.grid_h):
+            for c0 in range(self.grid_w):
+                if not clear[r0, c0] or seen[r0, c0]:
+                    continue
+                comp = np.zeros_like(clear)
+                queue = deque([(r0, c0)])
+                seen[r0, c0] = True
+                size = 0
+                while queue:
+                    r, c = queue.popleft()
+                    comp[r, c] = True
+                    size += 1
+                    for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                        if (0 <= nr < self.grid_h and 0 <= nc < self.grid_w
+                                and clear[nr, nc] and not seen[nr, nc]):
+                            seen[nr, nc] = True
+                            queue.append((nr, nc))
+                if size > best_size:
+                    best, best_size = comp, size
+        return best.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Geometry helpers (vectorised over robots)
@@ -355,16 +445,25 @@ class MultiRobotCoverageEnv:
         joint_actions : (N, 2) in [-1, 1]
         Returns (next_state, rewards (N,), terminated (), truncated ())
 
-        Rewards are per-agent:
-          - team coverage reward shared equally across all currently-alive robots
-          - collision kappa penalty applied only to the robot(s) that collided
-          - proximity psi penalty applied per robot proportional to nearness
+        Rewards follow the difference-reward principle: discovery, redundancy,
+        collision and proximity are all charged to the individual robot, so a
+        robot that lets the team do the work earns only the time penalty. The
+        two genuinely cooperative events (room completion, full coverage) are
+        the only shared terms.
 
-        Collision handling is per-robot, not per-episode: when
-        terminate_on_collision is True, a robot that collides dies (freezes
-        permanently and earns no further reward) while every other robot keeps
-        running. The episode-level `terminated` flag only fires once *all*
-        robots have died.
+        Collision handling is team-wide when terminate_on_collision is True:
+        a single robot hitting a wall or another robot terminates the episode
+        for everyone on that step. The offender is still marked dead in the
+        terminal state so the visualiser can identify it, but no robot gets to
+        act again. With the flag False, collisions are soft: the offender keeps
+        its position for that step, has its linear velocity zeroed, pays kappa,
+        and the episode runs on to full coverage or truncation.
+
+        Rotation is never blocked. The body is a disc, so turning on the spot
+        cannot create a new overlap, and letting a blocked robot still apply its
+        commanded omega is what makes a soft collision recoverable: a robot
+        pressed against a wall can turn away instead of grinding into it for the
+        rest of the episode.
         """
         alive     = state.robot_alive
         v_cmds    = (joint_actions[:, 0] + 1.0) * 0.5 * self.v_max
@@ -379,7 +478,8 @@ class MultiRobotCoverageEnv:
 
         blocked  = wall_hit | ~alive
         next_pos = jnp.where(blocked[:, None], state.robot_positions, cand_pos)
-        next_hdg = jnp.where(blocked, state.robot_headings, cand_hdg)
+        # Heading follows the command for every alive robot, blocked or not.
+        next_hdg = jnp.where(alive, cand_hdg, state.robot_headings)
 
         # --- Pairwise robot-robot collision on tentative non-wall positions ---
         # Dead robots remain solid obstacles at their frozen position but cannot
@@ -395,29 +495,52 @@ class MultiRobotCoverageEnv:
         # --- Apply movement to alive robots that did not collide ---
         moved   = alive & ~collided
         new_pos = jnp.where(moved[:, None], next_pos, state.robot_positions)
-        new_hdg = jnp.where(moved, next_hdg, state.robot_headings)
+        new_hdg = next_hdg
 
+        # A blocked robot travelled nothing this step: reporting the commanded
+        # v would tell the actor it is cruising while it is stuck against a
+        # wall. The applied omega is reported as-is, since rotation went through.
         new_vel = jnp.stack([
-            jnp.where(alive, v_cmds,     0.0),
+            jnp.where(moved, v_cmds,     0.0),
             jnp.where(alive, omega_cmds, 0.0),
         ], axis=-1)
 
-        # --- Coverage update: only for robots that successfully moved ---
+        # --- Per-agent coverage credit ---
         cols, rows = self._pos_to_cell(new_pos)
+        flat       = rows * self.grid_w + cols                     # (N,)
+        coverable  = self._free_flat[flat] > 0.0
         already    = prev_grid[rows, cols] > 0.0
-        delta_n    = jnp.sum(moved & ~already)
-        rho        = jnp.sum(moved & already)
+        eligible   = moved & coverable & ~already
+        # Two robots can enter the same unvisited cell on the same step; the cell
+        # is discovered once, so exactly one of them may be paid. A scatter-max
+        # over agent ids picks a single winner without any sequential pass.
+        ids   = self._robot_ids
+        claim = jnp.zeros((self.num_cells,), jnp.int32).at[flat].max(
+            jnp.where(eligible, ids + 1, 0)
+        )
+        discovered = eligible & (claim[flat] == ids + 1)
+        # Everything else an active robot does — re-entering a covered cell,
+        # sitting still, or bumping into a wall footprint — is redundant work.
+        redundant  = moved & ~discovered
+
         # `.max` leaves cells of ineligible robots untouched and is safe under
         # duplicate indices (several robots landing on the same cell).
-        new_grid = prev_grid.at[rows, cols].max(jnp.where(moved, 1.0, 0.0))
+        new_grid = prev_grid.at[rows, cols].max(
+            jnp.where(moved & coverable, 1.0, 0.0)
+        )
 
-        # --- Room completion bonus: fires once per room at the threshold ---
+        # --- Cooperative bonuses: room completion and full coverage ---
         covered   = jnp.sum(new_grid[None, :, :] * self.room_masks, axis=(1, 2))
         ratio     = covered / jnp.maximum(self.room_totals, 1.0)
         newly     = (~state.room_completed) & (self.room_totals > 0) \
                     & (ratio >= self.room_completion_threshold)
-        room_bonus = self.room_completion_bonus * jnp.sum(newly)
         room_completed = state.room_completed | newly
+
+        # The grid only ever holds free cells, so this reaches free_total exactly
+        # when the whole coverable area has been visited.
+        complete   = jnp.sum(new_grid) >= self.free_total - 0.5
+        team_bonus = (self.room_completion_bonus * jnp.sum(newly)
+                      + self.completion_bonus * complete)
 
         # --- Proximity penalty: soft repulsion before hard collision ---
         # Diagonal carries +inf from _pairwise_sq_dist, so self-pairs never fire.
@@ -426,16 +549,23 @@ class MultiRobotCoverageEnv:
         prox_pen = jnp.sum(pen, axis=1) * alive
 
         # --- Compose per-agent rewards ---
-        # Robots already dead at the start of this step get no reward at all; a
-        # robot dying on this step still receives its final team_r/coll_pen.
-        team_r   = self.alpha * delta_n - self.beta * rho - self.tau + room_bonus
-        coll_pen = self.kappa * collided
-        rewards  = jnp.where(alive, team_r - coll_pen - prox_pen, 0.0).astype(jnp.float32)
+        rewards = jnp.where(
+            alive,
+            self.alpha * discovered
+            - self.beta * redundant
+            - self.tau
+            - self.kappa * collided
+            - prox_pen
+            + team_bonus,
+            0.0,
+        ).astype(jnp.float32)
 
         step_count = state.step_count + 1
         truncated  = step_count >= self.max_steps
-        terminated = (~jnp.any(alive_next) if self.terminate_on_collision
-                      else jnp.bool_(False))
+        # Shared fate: one collision anywhere in the team ends the episode, and
+        # so does finishing the map — there is nothing left to earn.
+        terminated = complete | (jnp.any(collided) if self.terminate_on_collision
+                                 else jnp.bool_(False))
 
         next_state = state.replace(
             robot_positions  = new_pos,
@@ -487,12 +617,15 @@ class MultiRobotCoverageEnv:
         # --- Lidar sees walls AND other robots as obstacles ---
         parts.append(self._cast_lidar_all(state.robot_positions, state.robot_headings))
 
-        # --- Local coverage patch centred on each robot ---
+        # --- Local coverage patch centred on each robot (binary, kept last) ---
         if self.use_local_coverage_obs:
             r = self.local_coverage_size // 2
             s = self.local_coverage_size
+            # Non-free cells read as covered: they carry no reward, so showing
+            # them as pending would advertise work that does not exist.
+            source = jnp.maximum(state.coverage_grid, self.wall_grid)
             # Out-of-map padding reads as covered so robots are not drawn outside.
-            padded = jnp.pad(state.coverage_grid, r, constant_values=1.0)
+            padded = jnp.pad(source, r, constant_values=1.0)
             cols, rows = self._pos_to_cell(state.robot_positions)
             patches = jax.vmap(
                 lambda rw, cl: jax.lax.dynamic_slice(padded, (rw, cl), (s, s))
@@ -501,24 +634,61 @@ class MultiRobotCoverageEnv:
 
         return jnp.concatenate(parts, axis=1).astype(jnp.float32)
 
-    def get_global_state(self, state: EnvState) -> jax.Array:
-        """Centralised critic state: robot poses + human positions + coverage grid."""
-        return jnp.concatenate([
-            state.robot_positions.ravel(),
-            state.robot_headings,
-            state.human_positions.ravel(),
-            state.coverage_grid.ravel(),
-        ]).astype(jnp.float32)
+    def get_global_state(self, state: EnvState) -> GlobalState:
+        """Centralised critic state as compact spatial tensors."""
+        cols, rows = self._pos_to_cell(state.robot_positions)
+        occupancy = jnp.zeros(
+            (self.num_robots, self.grid_h, self.grid_w), jnp.float32
+        ).at[self._robot_ids, rows, cols].set(state.robot_alive.astype(jnp.float32))
+
+        kinematics = jnp.stack([
+            state.robot_positions[:, 0] / self.map_layout.width,
+            state.robot_positions[:, 1] / self.map_layout.height,
+            jnp.cos(state.robot_headings),
+            jnp.sin(state.robot_headings),
+            state.robot_velocities[:, 0] / self.v_max,
+            state.robot_velocities[:, 1] / self.omega_max,
+        ], axis=-1)
+
+        return GlobalState(state.coverage_grid, occupancy, kinematics)
+
+    def critic_inputs(self, gs: GlobalState) -> tuple[jax.Array, jax.Array]:
+        """Expand a `GlobalState` into per-agent critic inputs.
+
+        Accepts any number of leading batch dimensions and returns
+            grid : (..., N, 4, H, W)  channels [walls, coverage, self, teammates]
+            vec  : (..., N, 6 + 6N)   own kinematics followed by the joint vector
+
+        `robot_velocities` are the commanded actions of the previous step, so the
+        joint action history the centralised critic needs is already inside the
+        kinematic vector. The *current* joint action is deliberately excluded:
+        conditioning on it would turn this into Q(s, a), which cannot be used as
+        the GAE baseline that the per-agent advantage is built from.
+        """
+        occ  = gs.occupancy                                   # (..., N, H, W)
+        me   = occ[..., :, None, :, :]                        # (..., N, 1, H, W)
+        rest = (occ.sum(axis=-3, keepdims=True) - occ)[..., :, None, :, :]
+        cov  = jnp.broadcast_to(gs.coverage[..., None, None, :, :], me.shape)
+        wall = jnp.broadcast_to(self.wall_grid, me.shape)
+        grid = jnp.concatenate([wall, cov, me, rest], axis=-3)
+
+        joint = gs.kinematics.reshape(*gs.kinematics.shape[:-2], 1, -1)
+        vec = jnp.concatenate(
+            [gs.kinematics, jnp.broadcast_to(joint, (*gs.kinematics.shape[:-1],
+                                                     joint.shape[-1]))],
+            axis=-1,
+        )
+        return grid, vec
 
     def get_info(self, state: EnvState) -> dict:
         """Diagnostics. All values are arrays so the dict survives jit/vmap."""
         covered = jnp.sum(state.coverage_grid)
-        total   = float(self.grid_w * self.grid_h)
         room_cov = jnp.sum(state.coverage_grid[None, :, :] * self.room_masks, axis=(1, 2))
         info = {
-            'coverage_ratio':   covered / total,
+            # Denominator is the reachable free space, so 1.0 means "done".
+            'coverage_ratio':   covered / self.free_total,
             'covered_cells':    covered,
-            'total_cells':      jnp.float32(total),
+            'total_cells':      jnp.float32(self.free_total),
             'step':             state.step_count,
             'robots_alive':     state.robot_alive,
             'num_robots_alive': jnp.sum(state.robot_alive),

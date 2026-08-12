@@ -9,22 +9,38 @@ env:
   sensing_radius: 5.0    # radius within which teammates / humans are visible
   robot_radius: 0.20     # metres, used for collision and spawn clearance
   dt: 0.1                # physics time step (seconds)
-  max_steps: 500         # steps before truncation
+  # Horizon arithmetic: v_max × dt = 0.1 m per step against a 0.5 m cell, so a
+  # robot needs 5 steps to reach a new cell. 302 free cells / 3 robots ≈ 101
+  # cells each × 5 = ~505 steps for a *perfect* sweep with zero overlap and no
+  # turning. 500 was therefore the exact theoretical minimum, i.e. unreachable
+  # in practice; 1000 leaves 2× slack so full coverage is physically possible.
+  max_steps: 1000        # steps before truncation
   v_max: 1.0             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
   omega_max: 1.0         # max angular velocity (rad/s)
-  # soft collision: robots freeze for one step and receive a per-agent kappa penalty,
-  # episode continues — avoids prematurely ending good coverage runs due to a brief
-  # coordination lapse while robots are still learning to avoid each other
+  # soft collisions: a robot that hits a wall or a teammate keeps its position for
+  # that step (linear velocity zeroed, rotation still applied so it can turn away),
+  # pays kappa and carries on. Under hard termination the early random policy ended
+  # every episode after ~120 steps, so the team never lived long enough to reach
+  # the far rooms — exploration died before navigation could be learned.
   terminate_on_collision: false
   # local coverage patch: gives actors a birds-eye view of nearby coverage without
   # breaking decentralised execution — this is the key driver of efficient coverage
   use_local_coverage_obs: true
-  local_coverage_size: 7    # 7×7 = 49 binary cells centred on the robot
-  # reward weights
-  alpha: 10.0            # new cells covered
-  beta: 0.1              # redundant cell visits
-  kappa: 20.0            # hard collision penalty (per colliding agent only)
-  tau: 0.01              # per-step time penalty
+  local_coverage_size: 5    # 5×5 = 25 binary cells centred on the robot
+  # reward weights — difference reward: alpha, beta, kappa and psi are charged to
+  # the individual robot, the two completion bonuses are the only shared terms
+  alpha: 10.0            # new cell discovered by THIS robot
+  beta: 0.005            # redundant step (covered cell, or standing still)
+  # kappa is now a *recurring per-step* cost, not a one-off terminal one. At 20.0
+  # a robot grinding a wall for 50 steps would lose 1000 while idling costs only
+  # tau=0.05/step, so the policy's best reply would be to freeze — a worse local
+  # minimum than the one we are escaping. Scaled to per-step magnitudes it must
+  # sit below alpha=10 (one discovered cell): 1.0 deters without paralysing.
+  kappa: 1.0             # collision penalty per step, charged to the offender
+  tau: 0.05              # per-step time penalty
+  # beta < tau is a hard constraint checked by the env: crossing an already
+  # covered cell must be cheaper than idling, or robots learn to freeze rather
+  # than drive through explored ground to reach new ground
   # inter-robot proximity penalty: continuous soft repulsion before hard collision
   # fires when robots are within safe_dist_factor × robot_radius of each other
   psi: 1.5               # proximity penalty weight
@@ -33,11 +49,15 @@ env:
   # teaches robots to finish a room before moving to the next one
   room_completion_bonus: 50.0
   room_completion_threshold: 0.85
+  # global completion: paid to every robot when the whole reachable free space
+  # is covered, which also terminates the episode
+  completion_bonus: 200.0
 
 model:
-  hidden_size: 128       # MLP feature extractor width
-  gru_hidden: 128        # GRU hidden state size
+  hidden_size: 128       # actor MLP trunk width
+  lidar_embed: 64        # actor 1D-CNN embedding width
   critic_hidden: 256     # centralised critic MLP width
+  critic_map_embed: 128  # centralised critic 2D-CNN embedding width
 
 train:
   num_envs: 8            # parallel environment workers (set to your CPU core count)
@@ -51,7 +71,24 @@ train:
   lr_critic: 1.0e-3
   lr_decay: true         # linear decay to 0 over training
   clip_eps: 0.2
-  entropy_coef: 0.05     # higher entropy essential while robots are learning wall avoidance
+  # The bonus is charged against the entropy of the tanh-squashed policy, which
+  # is bounded and therefore self-limiting: the Jacobian term punishes a sigma
+  # that saturates tanh, so the coefficient can no longer blow sigma up the way
+  # 0.05 did before the squashed formulation. 1e-4 then proved too conservative
+  # — sigma decayed from 0.92 to 0.86 over 200 updates and the policy went
+  # deterministic before it could learn to thread doorways. 3e-3 holds sigma up
+  # for the first few thousand episodes so robots keep trying different
+  # manoeuvres at narrow passages.
+  entropy_coef: 3.0e-3
   max_grad_norm: 10.0
+  # Reward weights are in task units (a completion bonus is worth 200), which
+  # puts undiscounted returns in the hundreds and made the critic loss explode.
+  # A single constant factor pulls the critic targets back into roughly
+  # [-10, 10] without any running statistic to keep in sync. Logged episode
+  # rewards are divided back out, so the CSV stays in environment units.
+  reward_scale: 0.05
+  # Huber transition point, in scaled-reward units: errors above this contribute
+  # a constant gradient instead of a growing one.
+  huber_delta: 1.0
   n_epochs: 10           # PPO epochs per update
   normalize_obs: true    # RunningMeanStd normalisation for stable training

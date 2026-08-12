@@ -1,21 +1,26 @@
 """
-Multi-Agent PPO in JAX: centralised critic, parameter-shared recurrent actor.
+Multi-Agent PPO in JAX: centralised critic, parameter-shared feed-forward actor.
 
 The whole rollout is a `lax.scan` over the vectorised environment, so a full
 (T steps x E envs) batch is collected in one device call with no Python in the
 inner loop. The PPO update is likewise a `lax.scan` over epochs.
 
+Credit assignment is per agent end to end: the environment pays each robot for
+its own discoveries, the critic produces an agent-specific V_i(s) from the
+agent-centred global map, and GAE runs independently on every (env, agent)
+stream. Nothing is averaged across agents, so a robot that free-rides on the
+team's coverage sees its own advantage drop.
+
 Shapes
 ------
-obs       : (T, E, N, obs_dim)   — already observation-normalised
-gstate    : (T, E, state_dim)
+obs       : (T, E, N, obs_dim)   — continuous prefix normalised, binary tail raw
+gstate    : GlobalState pytree with leading (T, E)
 action    : (T, E, N, action_dim)
 log_prob  : (T, E, N)
-reward    : (T, E, N)
-value     : (T, E)
-term      : (T, E)               — hard termination (collision) only
+reward    : (T, E, N)           — already multiplied by `reward_scale`
+value     : (T, E, N)
+term      : (T, E)               — hard termination (collision, completion)
 done      : (T, E)               — terminated OR truncated
-hx        : (T, E, N, gru_hidden)
 
 `term` and `done` are stored as float32 0/1 masks rather than bools: jax-metal
 0.1.1 returns all-False for any bool-dtype `lax.scan` output, which would
@@ -36,7 +41,6 @@ from flax.training.train_state import TrainState
 from src.utils.jax_device import init_device as _pick_init_device
 
 _LOG_2PI = float(np.log(2.0 * np.pi))
-_ENTROPY_CONST = 0.5 * float(np.log(2.0 * np.pi * np.e))
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +62,12 @@ def rms_init(dim: int, eps: float = 1e-4) -> RunningMeanStd:
 
 
 def rms_update(rms: RunningMeanStd, x: jax.Array) -> RunningMeanStd:
-    """x : (B, dim) — a flat batch of observations."""
+    """x : (B, obs_dim) — a flat batch of observations.
+
+    Only the continuous prefix is tracked: `rms.mean` is shorter than the
+    observation whenever the environment appends a binary block.
+    """
+    x = x[:, : rms.mean.shape[-1]]
     batch_mean = jnp.mean(x, axis=0)
     batch_var = jnp.var(x, axis=0)
     batch_count = x.shape[0]
@@ -72,8 +81,19 @@ def rms_update(rms: RunningMeanStd, x: jax.Array) -> RunningMeanStd:
 
 
 def rms_normalize(rms: RunningMeanStd, x: jax.Array) -> jax.Array:
-    """Normalise x : (..., dim), preserving leading dimensions."""
-    return (x - rms.mean) / jnp.sqrt(rms.var + 1e-8)
+    """Normalise the continuous prefix of x : (..., obs_dim), leading dims kept.
+
+    The binary tail (local coverage patch) is passed through untouched. Dividing
+    a 0/1 cell by its own standard deviation turns a rarely-flipping cell into a
+    large spike and a constant cell into pure numerical noise, so those channels
+    are better left as the indicator they already are.
+    """
+    n = rms.mean.shape[-1]
+    head = (x[..., :n] - rms.mean) / jnp.sqrt(rms.var + 1e-8)
+    head = jnp.clip(head, -10.0, 10.0)
+    if x.shape[-1] == n:
+        return head
+    return jnp.concatenate([head, x[..., n:]], axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +102,14 @@ def rms_normalize(rms: RunningMeanStd, x: jax.Array) -> jax.Array:
 
 class Transition(NamedTuple):
     obs:      jax.Array
-    gstate:   jax.Array
-    action:   jax.Array
+    gstate:   object      # GlobalState pytree
+    action:   jax.Array   # tanh(z), what the environment consumed
+    z:        jax.Array   # pre-squash Gaussian sample, see _update
     log_prob: jax.Array
     reward:   jax.Array
     value:    jax.Array
     term:     jax.Array   # float32 0/1, not bool — see module docstring
     done:     jax.Array   # float32 0/1, not bool — see module docstring
-    hx:       jax.Array
     coverage: jax.Array
 
 
@@ -98,8 +118,7 @@ class RolloutCarry(NamedTuple):
 
     env_state: object
     obs:       jax.Array
-    gstate:    jax.Array
-    hx:        jax.Array
+    gstate:    object      # GlobalState pytree
     rms:       RunningMeanStd
 
 
@@ -116,14 +135,21 @@ def compute_gae(
     traj: Transition, last_value: jax.Array, gamma: float, gae_lambda: float
 ) -> tuple[jax.Array, jax.Array]:
     """
-    GAE-lambda advantages and discounted returns, independent per env.
+    GAE-lambda advantages and discounted returns, independent per env AND agent.
 
-    Masking uses `term` only: a hard termination (collision) stops the
-    bootstrap, whereas truncation keeps it because V(s_timeout) is meaningful.
+    Every array below carries a trailing agent axis and the recursion is
+    elementwise over it, so the scan is an implicit vmap over the (E, N) agent
+    slots at no extra cost: agent i's advantage depends only on its own reward
+    and value streams. Averaging rewards across agents here would undo the
+    difference reward the environment computes.
+
+    Masking uses `term` only: a hard termination (collision or completed map)
+    stops the bootstrap, whereas truncation keeps it because V(s_timeout) is
+    meaningful. Termination is a team event, so the mask broadcasts over agents.
     """
-    values = jnp.concatenate([traj.value, last_value[None, :]], axis=0)  # (T+1, E)
-    team_reward = jnp.mean(traj.reward, axis=-1)                        # (T, E)
-    mask = 1.0 - traj.term.astype(jnp.float32)
+    values = jnp.concatenate([traj.value, last_value[None]], axis=0)   # (T+1, E, N)
+    reward = traj.reward                                              # (T, E, N)
+    mask = (1.0 - traj.term.astype(jnp.float32))[:, :, None]          # (T, E, 1)
 
     def body(gae, xs):
         reward, value, next_value, m = xs
@@ -134,7 +160,7 @@ def compute_gae(
     _, advantages = jax.lax.scan(
         body,
         jnp.zeros_like(last_value),
-        (team_reward, values[:-1], values[1:], mask),
+        (reward, values[:-1], values[1:], jnp.broadcast_to(mask, reward.shape)),
         reverse=True,
     )
     return advantages, advantages + values[:-1]
@@ -186,6 +212,11 @@ class MAPPO:
         self.n_epochs      = int(config.get('n_epochs',      10))
         self.gamma         = float(config.get('gamma',         0.99))
         self.gae_lambda    = float(config.get('gae_lambda',    0.95))
+        # Static, stateless alternative to return normalisation: a constant
+        # factor keeps the whole pipeline a pure function of the rollout, with
+        # no running statistics to thread through the scan.
+        self.reward_scale  = float(config.get('reward_scale',  1.0))
+        self.huber_delta   = float(config.get('huber_delta',   1.0))
 
         self._update_fn = jax.jit(self._update)
 
@@ -197,18 +228,21 @@ class MAPPO:
         """Initialise parameters (on CPU when the backend lacks QR) and optimisers."""
         actor_key, critic_key = jax.random.split(key)
 
-        dummy_obs = jnp.zeros((1, self.env.obs_dim), jnp.float32)
-        dummy_hx = jnp.zeros((1, self.actor.gru_hidden), jnp.float32)
-        dummy_state = jnp.zeros((1, self.env.state_dim), jnp.float32)
+        env = self.env
+        dummy_obs  = jnp.zeros((1, env.obs_dim), jnp.float32)
+        dummy_grid = jnp.zeros(
+            (1, env.critic_channels, env.grid_h, env.grid_w), jnp.float32
+        )
+        dummy_vec  = jnp.zeros((1, env.critic_vec_dim), jnp.float32)
 
         with jax.default_device(self.init_device):
             args = jax.device_put(
-                (actor_key, critic_key, dummy_obs, dummy_hx, dummy_state),
+                (actor_key, critic_key, dummy_obs, dummy_grid, dummy_vec),
                 self.init_device,
             )
-            a_key, c_key, o, h, s = args
-            actor_params = self.actor.init(a_key, o, h)
-            critic_params = self.critic.init(c_key, s)
+            a_key, c_key, o, g, v = args
+            actor_params = self.actor.init(a_key, o)
+            critic_params = self.critic.init(c_key, g, v)
 
         actor_params = jax.device_put(actor_params, self.device)
         critic_params = jax.device_put(critic_params, self.device)
@@ -230,10 +264,19 @@ class MAPPO:
 
     def init_carry(self, key: jax.Array) -> RolloutCarry:
         env_state, obs, gstate, _ = self.env.reset(key)
-        hx = jnp.zeros(
-            (self.env.E, self.env.num_robots, self.actor.gru_hidden), jnp.float32
+        # Statistics cover only the continuous prefix of the observation.
+        return RolloutCarry(env_state, obs, gstate, rms_init(self.env.norm_dim))
+
+    def _values(self, critic_params, gstate) -> jax.Array:
+        """V_i(s) for every agent slot. gstate has leading (E,) -> (E, N)."""
+        e, n = self.env.E, self.env.num_robots
+        grid, vec = self.env.critic_inputs(gstate)
+        value = self.critic.apply(
+            critic_params,
+            grid.reshape(e * n, *grid.shape[-3:]),
+            vec.reshape(e * n, -1),
         )
-        return RolloutCarry(env_state, obs, gstate, hx, rms_init(self.env.obs_dim))
+        return value.reshape(e, n)
 
     # ------------------------------------------------------------------
     # Rollout collection (single device call for T steps)
@@ -265,16 +308,15 @@ class MAPPO:
             rms = rms_update(carry.rms, carry.obs.reshape(e * n, -1))
             obs_n = rms_normalize(rms, carry.obs)
 
-            mean, log_std, new_hx = self.actor.apply(
-                actor_params, obs_n.reshape(e * n, -1), carry.hx.reshape(e * n, -1)
-            )
+            mean, log_std = self.actor.apply(actor_params, obs_n.reshape(e * n, -1))
             std = jnp.exp(log_std)
             z = mean + std * jax.random.normal(step_key, mean.shape)
             action = jnp.tanh(z)
             log_prob = _tanh_normal_log_prob(z, mean, std, action).reshape(e, n)
             action = action.reshape(e, n, -1)
+            z = z.reshape(e, n, -1)
 
-            value = self.critic.apply(critic_params, carry.gstate).squeeze(-1)
+            value = self._values(critic_params, carry.gstate)
 
             env_state, next_obs, reward, term, done, info, next_gstate = self.env.step(
                 carry.env_state, action
@@ -286,22 +328,22 @@ class MAPPO:
                 obs=obs_n,
                 gstate=carry.gstate,
                 action=action,
+                z=z,
                 log_prob=log_prob,
-                reward=reward,
+                # Scaled once, here: everything downstream (GAE, returns, critic
+                # targets) inherits the smaller range, and the environment keeps
+                # its reward weights in physically meaningful units. Callers that
+                # report episode reward must divide by the same factor.
+                reward=reward * self.reward_scale,
                 value=value,
                 term=term.astype(jnp.float32),
                 done=done.astype(jnp.float32),
-                hx=carry.hx,
                 coverage=info['coverage_ratio'],
             )
-
-            # Any episode end (collision or timeout) resets the recurrent state.
-            # `done` here is the in-body value, unaffected by the scan-output bug.
-            next_hx = new_hx.reshape(e, n, -1) * (1.0 - done.astype(jnp.float32))[:, None, None]
-            return RolloutCarry(env_state, next_obs, next_gstate, next_hx, rms), transition
+            return RolloutCarry(env_state, next_obs, next_gstate, rms), transition
 
         carry, traj = jax.lax.scan(step, carry, jax.random.split(key, num_steps))
-        last_value = self.critic.apply(critic_params, carry.gstate).squeeze(-1)
+        last_value = self._values(critic_params, carry.gstate)
         return carry, traj, last_value
 
     # ------------------------------------------------------------------
@@ -321,55 +363,87 @@ class MAPPO:
         t, e, n = traj.obs.shape[0], traj.obs.shape[1], traj.obs.shape[2]
         flat = t * e * n
 
-        # Each (t, e, i) triple is processed independently
-        # (truncated-BPTT-length-1 approximation).
+        # Every (t, e, i) triple is an independent sample: the actor is
+        # feed-forward, so there is no sequence to keep together.
         obs_f = traj.obs.reshape(flat, -1)
         act_f = traj.action.reshape(flat, -1)
+        # The pre-squash sample is replayed from the rollout instead of being
+        # recovered with arctanh(action): arctanh needs the action clipped away
+        # from +-1 first, and that clip silently rewrites z for exactly the
+        # saturated samples that dominate once sigma grows, corrupting the ratio.
+        z_f = traj.z.reshape(flat, -1)
         old_log_prob = traj.log_prob.reshape(flat)
-        hx_f = traj.hx.reshape(flat, -1)
 
-        # Shared advantage: one value per (t, e), broadcast over N agents.
+        # Per-agent advantage; the batch statistics are shared, the values are
+        # not. Normalised over the whole (T, E, N) batch, once, before the
+        # epoch scan: every epoch must see the same targets.
         adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        adv_f = jnp.broadcast_to(adv[:, :, None], (t, e, n)).reshape(flat)
+        adv_f = adv.reshape(flat)
 
-        states_f = traj.gstate.reshape(t * e, -1)
-        returns_f = returns.reshape(t * e)
+        # Expanded once here rather than inside the epoch scan: the per-agent
+        # channel stack is the largest tensor in the update.
+        grid, vec = self.env.critic_inputs(traj.gstate)
+        grid_f = grid.reshape(flat, *grid.shape[-3:])
+        vec_f = vec.reshape(flat, -1)
+        returns_f = returns.reshape(flat)
 
         def actor_loss_fn(params):
-            mean, log_std, _ = self.actor.apply(params, obs_f, hx_f)
+            mean, log_std = self.actor.apply(params, obs_f)
             std = jnp.exp(log_std)
-            z = jnp.arctanh(jnp.clip(act_f, -1.0 + 1e-6, 1.0 - 1e-6))
-            log_prob = _tanh_normal_log_prob(z, mean, std, act_f)
+            log_prob = _tanh_normal_log_prob(z_f, mean, std, act_f)
 
             ratio = jnp.exp(log_prob - old_log_prob)
             surr1 = ratio * adv_f
             surr2 = jnp.clip(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_f
             loss = -jnp.mean(jnp.minimum(surr1, surr2))
-            entropy = jnp.sum(_ENTROPY_CONST + log_std)
-            return loss - self.entropy_coef * entropy, (loss, entropy)
+
+            # Entropy of the SQUASHED policy, estimated as -E[log pi(a)] on the
+            # rollout samples. The Gaussian entropy alone, sum(0.5*log(2*pi*e)
+            # + log_std), is linear and unbounded in log_std: its gradient is a
+            # constant -entropy_coef push towards a wider sigma that nothing
+            # balances once tanh saturates and the surrogate stops caring about
+            # z. That is what made the logged entropy climb monotonically while
+            # coverage collapsed. The Jacobian term, sum(log(1 - a^2)), diverges
+            # to -inf as the actions saturate, so this estimate is self-limiting:
+            # widening sigma past the useful range now *costs* entropy.
+            entropy = jnp.mean(-log_prob)
+            return loss - self.entropy_coef * entropy, (loss, entropy, jnp.mean(std))
 
         def critic_loss_fn(params):
-            values = self.critic.apply(params, states_f).squeeze(-1)
-            return 0.5 * jnp.mean((values - returns_f) ** 2)
+            values = self.critic.apply(params, grid_f, vec_f).squeeze(-1)
+            # Huber rather than MSE: the completion bonuses are sparse and large,
+            # so a single unpredicted bonus produces an error the squared loss
+            # amplifies into a gradient that wipes out the value head. Huber is
+            # quadratic within delta and linear beyond it, which caps the
+            # per-sample gradient at delta — gradient clipping that acts per
+            # sample instead of on the summed batch norm.
+            # optax.huber_loss already carries the 0.5 factor in the quadratic
+            # branch, so no extra scaling here.
+            return jnp.mean(
+                optax.huber_loss(values, returns_f, delta=self.huber_delta)
+            )
 
         def epoch(carry, _):
             a_state, c_state = carry
-            (_, (a_loss, entropy)), a_grads = jax.value_and_grad(
+            (_, (a_loss, entropy, std)), a_grads = jax.value_and_grad(
                 actor_loss_fn, has_aux=True
             )(a_state.params)
             a_state = _apply_gradients(a_state, a_grads, lr_actor)
 
             c_loss, c_grads = jax.value_and_grad(critic_loss_fn)(c_state.params)
             c_state = _apply_gradients(c_state, c_grads, lr_critic)
-            return (a_state, c_state), (a_loss, c_loss, entropy)
+            return (a_state, c_state), (a_loss, c_loss, entropy, std)
 
-        (actor_state, critic_state), (a_losses, c_losses, entropies) = jax.lax.scan(
+        (actor_state, critic_state), (a_losses, c_losses, entropies, stds) = jax.lax.scan(
             epoch, (actor_state, critic_state), None, length=self.n_epochs
         )
         metrics = {
             'actor_loss':  jnp.mean(a_losses),
             'critic_loss': jnp.mean(c_losses),
             'entropy':     jnp.mean(entropies),
+            # Logged explicitly: sigma is the quantity that actually diverged,
+            # and reading it off the entropy is guesswork once tanh is involved.
+            'std':         stds[-1],
         }
         return actor_state, critic_state, metrics
 
@@ -385,9 +459,7 @@ class MAPPO:
     # ------------------------------------------------------------------
 
     @partial(jax.jit, static_argnums=(0,))
-    def act_deterministic(
-        self, actor_params, obs: jax.Array, hx: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        """Greedy action tanh(mean) for evaluation. obs/hx are (B, ...)."""
-        mean, _, new_hx = self.actor.apply(actor_params, obs, hx)
-        return jnp.tanh(mean), new_hx
+    def act_deterministic(self, actor_params, obs: jax.Array) -> jax.Array:
+        """Greedy action tanh(mean) for evaluation. obs is (B, obs_dim)."""
+        mean, _ = self.actor.apply(actor_params, obs)
+        return jnp.tanh(mean)

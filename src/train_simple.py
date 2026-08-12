@@ -14,7 +14,7 @@ import numpy as np
 
 from src.algorithms.mappo import MAPPO, RunningMeanStd, compute_gae
 from src.envs.vec_env import VecEnv
-from src.models.actor_critic_mlp import Actor, Critic
+from src.models.actor_critic import Actor, Critic
 from src.utils.config_parser import load_config
 from src.utils.jax_device import describe, select_device
 
@@ -69,22 +69,31 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
     num_envs = train_cfg.get('num_envs', 4)
 
     vec_env    = VecEnv(num_envs, env_cfg)
+    env        = vec_env.env
     E          = vec_env.E
     N          = vec_env.num_robots
     obs_dim    = vec_env.obs_dim
-    state_dim  = vec_env.state_dim
     action_dim = vec_env.action_dim
 
-    print(f"Parallel envs: {E}  |  robots/env: {N}  |  "
-          f"obs_dim: {obs_dim}  |  state_dim: {state_dim}")
+    print(f"Parallel envs: {E}  |  robots/env: {N}  |  obs_dim: {obs_dim}  |  "
+          f"critic map: {vec_env.critic_channels}x{vec_env.grid_h}x{vec_env.grid_w}"
+          f" + {vec_env.critic_vec_dim}")
+    print(f"Coverable cells: {int(env.free_total)} / {env.num_cells} "
+          f"({env.free_total / env.num_cells:.1%} of the grid)")
 
-    hidden_size   = model_cfg.get('hidden_size',   128)
-    gru_hidden    = model_cfg.get('gru_hidden',    128)
-    critic_hidden = model_cfg.get('critic_hidden', 256)
-
-    actor  = Actor(action_dim, hidden_size, gru_hidden)
-    critic = Critic(critic_hidden)
-    mappo  = MAPPO(actor, critic, vec_env, train_cfg, device=device)
+    actor = Actor(
+        action_dim=action_dim,
+        vec_dim=env.obs_vec_dim,
+        n_rays=env.n_rays,
+        patch_dim=env.patch_dim,
+        lidar_embed=model_cfg.get('lidar_embed',  64),
+        hidden_size=model_cfg.get('hidden_size', 128),
+    )
+    critic = Critic(
+        hidden_size=model_cfg.get('critic_hidden',    256),
+        map_embed=model_cfg.get('critic_map_embed', 128),
+    )
+    mappo = MAPPO(actor, critic, vec_env, train_cfg, device=device)
 
     T             = train_cfg.get('rollout_steps',  256)
     total_updates = train_cfg.get('total_updates',  3000)
@@ -95,6 +104,10 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
     lr_decay      = train_cfg.get('lr_decay',       True)
     lr_actor_0    = train_cfg.get('lr_actor',       3e-4)
     lr_critic_0   = train_cfg.get('lr_critic',      1e-3)
+    # The trajectory carries rewards already scaled for the critic; undo it for
+    # reporting so the logged episode reward stays in environment units and
+    # remains comparable across runs with different scales.
+    reward_scale  = train_cfg.get('reward_scale',   1.0)
 
     key = jax.random.PRNGKey(train_cfg.get('seed', 0))
     key, init_key, reset_key = jax.random.split(key, 3)
@@ -116,10 +129,12 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
 
     with open(log_path, 'w', newline='') as f:
         csv.writer(f).writerow(['update', 'episodes', 'mean_ep_reward',
-                                'coverage_ratio', 'actor_loss', 'critic_loss', 'entropy'])
+                                'mean_ep_coverage', 'coverage_ratio',
+                                'actor_loss', 'critic_loss', 'entropy', 'std'])
 
     ep_reward = np.zeros(E, dtype=np.float64)   # per-env accumulator
     ep_rewards: list[float] = []
+    ep_coverages: list[float] = []              # coverage reached at episode end
     ep_count = 0
     best_mean_reward = -np.inf
 
@@ -150,13 +165,16 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
         # ----------------------------------------------------------------
         # Episode bookkeeping (host-side, from the stacked rollout)
         # ----------------------------------------------------------------
-        team_rewards = np.asarray(jnp.mean(traj.reward, axis=-1))   # (T, E)
+        team_rewards = np.asarray(jnp.mean(traj.reward, axis=-1)) / reward_scale
         dones = np.asarray(traj.done)                               # (T, E)
+        coverage = np.asarray(traj.coverage)                        # (T, E)
         for t in range(T):
             ep_reward += team_rewards[t]
             finished = np.nonzero(dones[t])[0]
             for e in finished:
                 ep_rewards.append(float(ep_reward[e]))
+                # Pre-reset info, so this is the coverage the episode finished on.
+                ep_coverages.append(float(coverage[t, e]))
                 ep_reward[e] = 0.0
                 ep_count += 1
 
@@ -166,24 +184,31 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
         if update % log_interval == 0:
             window = ep_rewards[-20:] if ep_rewards else [0.0]
             mean_ep_r = float(np.mean(window))
-            last_cov = float(np.asarray(traj.coverage)[-1].mean())
+            # Success metric: cells covered when the episode ended, averaged
+            # over the same 20-episode window as the reward.
+            cov_window = ep_coverages[-20:] if ep_coverages else [0.0]
+            mean_ep_cov = float(np.mean(cov_window))
+            last_cov = float(coverage[-1].mean())
             losses = jax.device_get(metrics)
             print(
                 f"Update {update:5d}/{total_updates} | "
                 f"episodes={ep_count:6d} | "
                 f"mean_ep_r={mean_ep_r:8.3f} | "
+                f"success={mean_ep_cov:6.2%} | "
                 f"coverage={last_cov:.2%} | "
                 f"actor={float(losses['actor_loss']):7.4f} | "
                 f"critic={float(losses['critic_loss']):7.4f} | "
-                f"entropy={float(losses['entropy']):6.4f}"
+                f"entropy={float(losses['entropy']):6.4f} | "
+                f"std={float(losses['std']):5.3f}"
             )
             with open(log_path, 'a', newline='') as f:
                 csv.writer(f).writerow([
                     update, ep_count, round(mean_ep_r, 4),
-                    round(last_cov, 4),
+                    round(mean_ep_cov, 4), round(last_cov, 4),
                     round(float(losses['actor_loss']),  4),
                     round(float(losses['critic_loss']), 4),
                     round(float(losses['entropy']),     4),
+                    round(float(losses['std']),         4),
                 ])
             if ep_count > 0 and mean_ep_r > best_mean_reward:
                 best_mean_reward = mean_ep_r
