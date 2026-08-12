@@ -42,6 +42,12 @@ The project evaluates architectures in increasing order of complexity:
 ## ⚙️ Implementation Constraints
 
 * **Framework:** 100% implemented in **JAX**, optimized for high-performance **CUDA** execution.
+* **Backend selection:** `train_simple.py` picks its device automatically — Apple **Metal** (via `jax-metal`) on Apple Silicon, otherwise **CUDA** when an NVIDIA GPU is visible, otherwise **CPU**. Override with `--backend {auto,metal,cuda,cpu}`.
+
+> **Note on Apple Silicon:** `jax-metal` is experimental. On an M1 Pro the Metal
+> backend measures ~2× *slower* than the CPU backend for the baseline config,
+> because the networks are small and the rollout is dominated by many tiny
+> kernel dispatches. Prefer `--backend cpu` on Mac unless you scale the model up.
 
 ---
 

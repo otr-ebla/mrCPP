@@ -1,107 +1,159 @@
+"""
+Multi-Agent PPO in JAX: centralised critic, parameter-shared recurrent actor.
+
+The whole rollout is a `lax.scan` over the vectorised environment, so a full
+(T steps x E envs) batch is collected in one device call with no Python in the
+inner loop. The PPO update is likewise a `lax.scan` over epochs.
+
+Shapes
+------
+obs       : (T, E, N, obs_dim)   — already observation-normalised
+gstate    : (T, E, state_dim)
+action    : (T, E, N, action_dim)
+log_prob  : (T, E, N)
+reward    : (T, E, N)
+value     : (T, E)
+term      : (T, E)               — hard termination (collision) only
+done      : (T, E)               — terminated OR truncated
+hx        : (T, E, N, gru_hidden)
+
+`term` and `done` are stored as float32 0/1 masks rather than bools: jax-metal
+0.1.1 returns all-False for any bool-dtype `lax.scan` output, which would
+silently erase every episode boundary from the trajectory (see `rollout`).
+"""
+
 from __future__ import annotations
 
+from functools import partial
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.distributions import Normal
+import optax
+from flax.training.train_state import TrainState
+
+from src.utils.jax_device import init_device as _pick_init_device
+
+_LOG_2PI = float(np.log(2.0 * np.pi))
+_ENTROPY_CONST = 0.5 * float(np.log(2.0 * np.pi * np.e))
 
 
-class RolloutBuffer:
+# ---------------------------------------------------------------------------
+# Observation normalisation (Welford, as a JAX pytree)
+# ---------------------------------------------------------------------------
+
+class RunningMeanStd(NamedTuple):
+    mean:  jax.Array
+    var:   jax.Array
+    count: jax.Array
+
+
+def rms_init(dim: int, eps: float = 1e-4) -> RunningMeanStd:
+    return RunningMeanStd(
+        jnp.zeros((dim,), jnp.float32),
+        jnp.ones((dim,), jnp.float32),
+        jnp.float32(eps),
+    )
+
+
+def rms_update(rms: RunningMeanStd, x: jax.Array) -> RunningMeanStd:
+    """x : (B, dim) — a flat batch of observations."""
+    batch_mean = jnp.mean(x, axis=0)
+    batch_var = jnp.var(x, axis=0)
+    batch_count = x.shape[0]
+
+    total = rms.count + batch_count
+    delta = batch_mean - rms.mean
+    mean = rms.mean + delta * batch_count / total
+    m2 = rms.var * rms.count + batch_var * batch_count \
+        + delta ** 2 * rms.count * batch_count / total
+    return RunningMeanStd(mean, m2 / total, total)
+
+
+def rms_normalize(rms: RunningMeanStd, x: jax.Array) -> jax.Array:
+    """Normalise x : (..., dim), preserving leading dimensions."""
+    return (x - rms.mean) / jnp.sqrt(rms.var + 1e-8)
+
+
+# ---------------------------------------------------------------------------
+# Rollout data
+# ---------------------------------------------------------------------------
+
+class Transition(NamedTuple):
+    obs:      jax.Array
+    gstate:   jax.Array
+    action:   jax.Array
+    log_prob: jax.Array
+    reward:   jax.Array
+    value:    jax.Array
+    term:     jax.Array   # float32 0/1, not bool — see module docstring
+    done:     jax.Array   # float32 0/1, not bool — see module docstring
+    hx:       jax.Array
+    coverage: jax.Array
+
+
+class RolloutCarry(NamedTuple):
+    """State threaded across rollout steps and between successive updates."""
+
+    env_state: object
+    obs:       jax.Array
+    gstate:    jax.Array
+    hx:        jax.Array
+    rms:       RunningMeanStd
+
+
+def _tanh_normal_log_prob(
+    z: jax.Array, mean: jax.Array, std: jax.Array, action: jax.Array
+) -> jax.Array:
+    """Log density of a tanh-squashed Normal, summed over the action dimension."""
+    log_prob = -0.5 * ((z - mean) / std) ** 2 - jnp.log(std) - 0.5 * _LOG_2PI
+    log_prob = log_prob - jnp.log(1.0 - action ** 2 + 1e-6)
+    return jnp.sum(log_prob, axis=-1)
+
+
+def compute_gae(
+    traj: Transition, last_value: jax.Array, gamma: float, gae_lambda: float
+) -> tuple[jax.Array, jax.Array]:
     """
-    Fixed-length (T steps, E parallel envs, N agents) experience buffer.
+    GAE-lambda advantages and discounted returns, independent per env.
 
-    All tensors live on the target device.  The buffer is filled one step at a
-    time via insert(), then compute_returns() closes the GAE computation and
-    resets the write pointer so the buffer can be reused.
-
-    Shapes
-    ------
-    obs       : (T, E, N, obs_dim)
-    states    : (T, E, state_dim)
-    actions   : (T, E, N, action_dim)
-    log_probs : (T, E, N)
-    rewards   : (T, E, N)
-    values    : (T+1, E)     — +1 row for the bootstrap value
-    dones     : (T, E)       — 1.0 when the episode terminates (hard collision)
-    hx        : (T, E, N, gru_hidden)
+    Masking uses `term` only: a hard termination (collision) stops the
+    bootstrap, whereas truncation keeps it because V(s_timeout) is meaningful.
     """
+    values = jnp.concatenate([traj.value, last_value[None, :]], axis=0)  # (T+1, E)
+    team_reward = jnp.mean(traj.reward, axis=-1)                        # (T, E)
+    mask = 1.0 - traj.term.astype(jnp.float32)
 
-    def __init__(
-        self,
-        T: int,
-        E: int,
-        N: int,
-        obs_dim: int,
-        state_dim: int,
-        action_dim: int,
-        gru_hidden: int,
-        device: torch.device,
-    ):
-        self.T, self.E, self.N = T, E, N
-        self.device = device
+    def body(gae, xs):
+        reward, value, next_value, m = xs
+        delta = reward + gamma * next_value * m - value
+        gae = delta + gamma * gae_lambda * m * gae
+        return gae, gae
 
-        self.obs       = torch.zeros(T, E, N, obs_dim,    device=device)
-        self.states    = torch.zeros(T, E, state_dim,     device=device)
-        self.actions   = torch.zeros(T, E, N, action_dim, device=device)
-        self.log_probs = torch.zeros(T, E, N,             device=device)
-        self.rewards   = torch.zeros(T, E, N,             device=device)
-        self.values    = torch.zeros(T + 1, E,            device=device)   # +1 for bootstrap
-        self.dones     = torch.zeros(T, E,                device=device)
-        self.hx        = torch.zeros(T, E, N, gru_hidden, device=device)
-        self.ptr       = 0
+    _, advantages = jax.lax.scan(
+        body,
+        jnp.zeros_like(last_value),
+        (team_reward, values[:-1], values[1:], mask),
+        reverse=True,
+    )
+    return advantages, advantages + values[:-1]
 
-        self.advantages: torch.Tensor | None = None
-        self.returns:    torch.Tensor | None = None
 
-    def insert(
-        self,
-        obs:       torch.Tensor,   # (E, N, obs_dim)
-        states:    torch.Tensor,   # (E, state_dim)
-        actions:   torch.Tensor,   # (E, N, action_dim)
-        log_probs: torch.Tensor,   # (E, N)
-        rewards:   torch.Tensor,   # (E, N)
-        values:    torch.Tensor,   # (E,)
-        dones:     torch.Tensor,   # (E,)
-        hx:        torch.Tensor,   # (E, N, gru_hidden)
-    ) -> None:
-        t = self.ptr
-        self.obs[t]       = obs
-        self.states[t]    = states
-        self.actions[t]   = actions
-        self.log_probs[t] = log_probs
-        self.rewards[t]   = rewards
-        self.values[t]    = values
-        self.dones[t]     = dones
-        self.hx[t]        = hx
-        self.ptr += 1
+def _apply_gradients(state: TrainState, grads, lr: jax.Array) -> TrainState:
+    """Adam step with an explicitly supplied (traceable) learning rate.
 
-    def compute_returns(
-        self,
-        last_values: torch.Tensor,   # (E,)
-        gamma:       float,
-        gae_lambda:  float,
-    ) -> None:
-        """
-        GAE-λ advantage and discounted return computation, independent per env.
-
-        last_values — V(s_T) bootstrap value for each env after the last stored step.
-        dones       — 1 only on hard termination (collision); truncation bootstraps normally.
-        """
-        self.values[self.ptr] = last_values   # (E,)
-
-        advantages = torch.zeros(self.T, self.E, device=self.device)
-        gae        = torch.zeros(self.E,         device=self.device)
-
-        for t in reversed(range(self.T)):
-            mask   = 1.0 - self.dones[t]                            # (E,)
-            team_r = self.rewards[t].mean(dim=-1)                    # (E,) — mean over N agents
-            delta  = team_r + gamma * self.values[t + 1] * mask - self.values[t]
-            gae    = delta + gamma * gae_lambda * mask * gae
-            advantages[t] = gae
-
-        self.returns    = advantages + self.values[: self.T]   # (T, E)
-        self.advantages = advantages                            # (T, E)
-        self.ptr        = 0
+    `tx` holds gradient clipping and Adam's moment rescaling; multiplying by
+    -lr afterwards is exactly what optax.adam's final scaling does, but keeps
+    the rate a traced value so it can be decayed without rebuilding the state.
+    """
+    updates, opt_state = state.tx.update(grads, state.opt_state, state.params)
+    updates = jax.tree_util.tree_map(lambda u: -lr * u, updates)
+    return state.replace(
+        step=state.step + 1,
+        params=optax.apply_updates(state.params, updates),
+        opt_state=opt_state,
+    )
 
 
 class MAPPO:
@@ -109,7 +161,7 @@ class MAPPO:
     Multi-Agent PPO with a centralised critic and parameter-shared actor.
 
     Supports E parallel environments: all actor and critic forward passes are
-    batched across (E × N) agent-slots in a single call, so data collection is
+    batched across (E x N) agent-slots in a single call, so data collection is
     as fast as a single vectorised network pass.
     """
 
@@ -117,129 +169,225 @@ class MAPPO:
         self,
         actor,
         critic,
+        vec_env,
         config: dict,
-        device: str = 'cpu',
+        device: jax.Device | None = None,
     ):
-        self.actor  = actor.to(device)
-        self.critic = critic.to(device)
-        self.device = torch.device(device)
+        self.actor = actor
+        self.critic = critic
+        self.env = vec_env
 
-        self.actor_opt = torch.optim.Adam(
-            actor.parameters(),  lr=config.get('lr_actor',  3e-4), eps=1e-5
-        )
-        self.critic_opt = torch.optim.Adam(
-            critic.parameters(), lr=config.get('lr_critic', 1e-3), eps=1e-5
-        )
+        self.device = device or jax.devices()[0]
+        self.init_device = _pick_init_device(self.device)
 
-        self.clip_eps      = config.get('clip_eps',      0.2)
-        self.entropy_coef  = config.get('entropy_coef',  0.01)
-        self.max_grad_norm = config.get('max_grad_norm', 10.0)
-        self.n_epochs      = config.get('n_epochs',      10)
-        self.gamma         = config.get('gamma',         0.99)
-        self.gae_lambda    = config.get('gae_lambda',    0.95)
+        self.clip_eps      = float(config.get('clip_eps',      0.2))
+        self.entropy_coef  = float(config.get('entropy_coef',  0.01))
+        self.max_grad_norm = float(config.get('max_grad_norm', 10.0))
+        self.n_epochs      = int(config.get('n_epochs',      10))
+        self.gamma         = float(config.get('gamma',         0.99))
+        self.gae_lambda    = float(config.get('gae_lambda',    0.95))
+
+        self._update_fn = jax.jit(self._update)
 
     # ------------------------------------------------------------------
-    # Action sampling (no gradients, used during rollout collection)
+    # Initialisation
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def get_actions(
+    def create_train_states(self, key: jax.Array) -> tuple[TrainState, TrainState]:
+        """Initialise parameters (on CPU when the backend lacks QR) and optimisers."""
+        actor_key, critic_key = jax.random.split(key)
+
+        dummy_obs = jnp.zeros((1, self.env.obs_dim), jnp.float32)
+        dummy_hx = jnp.zeros((1, self.actor.gru_hidden), jnp.float32)
+        dummy_state = jnp.zeros((1, self.env.state_dim), jnp.float32)
+
+        with jax.default_device(self.init_device):
+            args = jax.device_put(
+                (actor_key, critic_key, dummy_obs, dummy_hx, dummy_state),
+                self.init_device,
+            )
+            a_key, c_key, o, h, s = args
+            actor_params = self.actor.init(a_key, o, h)
+            critic_params = self.critic.init(c_key, s)
+
+        actor_params = jax.device_put(actor_params, self.device)
+        critic_params = jax.device_put(critic_params, self.device)
+
+        # Adam's learning rate is applied in _apply_gradients so it stays traceable.
+        def make_tx():
+            return optax.chain(
+                optax.clip_by_global_norm(self.max_grad_norm),
+                optax.scale_by_adam(eps=1e-5),
+            )
+
+        actor_state = TrainState.create(
+            apply_fn=self.actor.apply, params=actor_params, tx=make_tx()
+        )
+        critic_state = TrainState.create(
+            apply_fn=self.critic.apply, params=critic_params, tx=make_tx()
+        )
+        return actor_state, critic_state
+
+    def init_carry(self, key: jax.Array) -> RolloutCarry:
+        env_state, obs, gstate, _ = self.env.reset(key)
+        hx = jnp.zeros(
+            (self.env.E, self.env.num_robots, self.actor.gru_hidden), jnp.float32
+        )
+        return RolloutCarry(env_state, obs, gstate, hx, rms_init(self.env.obs_dim))
+
+    # ------------------------------------------------------------------
+    # Rollout collection (single device call for T steps)
+    # ------------------------------------------------------------------
+
+    @partial(jax.jit, static_argnums=(0, 4))
+    def rollout(
         self,
-        obs_np:   np.ndarray,   # (E, N, obs_dim)
-        state_np: np.ndarray,   # (E, state_dim)
-        hx:       torch.Tensor, # (E, N, gru_hidden)  on device
-    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor]:
+        actor_params,
+        critic_params,
+        carry: RolloutCarry,
+        num_steps: int,
+        key: jax.Array,
+    ) -> tuple[RolloutCarry, Transition, jax.Array]:
+        """Collect `num_steps` transitions across all E envs.
+
+        Takes raw parameters rather than TrainStates so the optimiser state is
+        not passed through the jit boundary (jax-metal rejects the resulting
+        signature).
+
+        Returns the updated carry, the stacked trajectory, and the bootstrap
+        value V(s_T) for each env.
         """
-        Returns
-        -------
-        actions   : (E, N, action_dim)  numpy, squashed to (-1, 1)
-        log_probs : (E, N)              tensor (CPU)
-        values    : (E,)                tensor (CPU)
-        new_hx    : (E, N, gru_hidden)  tensor (device)
-        """
-        E, N = obs_np.shape[:2]
+        e, n = self.env.E, self.env.num_robots
 
-        obs   = torch.from_numpy(obs_np).float().to(self.device)    # (E, N, obs_dim)
-        state = torch.from_numpy(state_np).float().to(self.device)  # (E, state_dim)
+        def step(carry: RolloutCarry, step_key: jax.Array):
+            # Statistics are refreshed on the raw observation before it is
+            # normalised, matching the order used during evaluation.
+            rms = rms_update(carry.rms, carry.obs.reshape(e * n, -1))
+            obs_n = rms_normalize(rms, carry.obs)
 
-        # Flatten E×N into one batch for the shared actor
-        obs_f = obs.reshape(E * N, -1)
-        hx_f  = hx.reshape(E * N, -1)
+            mean, log_std, new_hx = self.actor.apply(
+                actor_params, obs_n.reshape(e * n, -1), carry.hx.reshape(e * n, -1)
+            )
+            std = jnp.exp(log_std)
+            z = mean + std * jax.random.normal(step_key, mean.shape)
+            action = jnp.tanh(z)
+            log_prob = _tanh_normal_log_prob(z, mean, std, action).reshape(e, n)
+            action = action.reshape(e, n, -1)
 
-        mean, log_std, new_hx_f = self.actor(obs_f, hx_f)
-        std  = log_std.exp().expand_as(mean)
-        dist = Normal(mean, std)
-        z    = dist.sample()
-        a    = torch.tanh(z)
-        lp   = (dist.log_prob(z) - torch.log(1.0 - a.pow(2) + 1e-6)).sum(-1)  # (E*N,)
+            value = self.critic.apply(critic_params, carry.gstate).squeeze(-1)
 
-        a      = a.reshape(E, N, -1)       # (E, N, action_dim)
-        lp     = lp.reshape(E, N)          # (E, N)
-        new_hx = new_hx_f.reshape(E, N, -1)
+            env_state, next_obs, reward, term, done, info, next_gstate = self.env.step(
+                carry.env_state, action
+            )
 
-        # Centralised critic: one value per env
-        values = self.critic(state).squeeze(-1)   # (E,)
+            # Emitted as float32 masks: jax-metal 0.1.1 returns all-False for
+            # bool-dtype scan outputs, which would drop every episode boundary.
+            transition = Transition(
+                obs=obs_n,
+                gstate=carry.gstate,
+                action=action,
+                log_prob=log_prob,
+                reward=reward,
+                value=value,
+                term=term.astype(jnp.float32),
+                done=done.astype(jnp.float32),
+                hx=carry.hx,
+                coverage=info['coverage_ratio'],
+            )
 
-        return a.cpu().numpy(), lp.cpu(), values.cpu(), new_hx
+            # Any episode end (collision or timeout) resets the recurrent state.
+            # `done` here is the in-body value, unaffected by the scan-output bug.
+            next_hx = new_hx.reshape(e, n, -1) * (1.0 - done.astype(jnp.float32))[:, None, None]
+            return RolloutCarry(env_state, next_obs, next_gstate, next_hx, rms), transition
+
+        carry, traj = jax.lax.scan(step, carry, jax.random.split(key, num_steps))
+        last_value = self.critic.apply(critic_params, carry.gstate).squeeze(-1)
+        return carry, traj, last_value
 
     # ------------------------------------------------------------------
     # Policy update
     # ------------------------------------------------------------------
 
-    def update(self, buffer: RolloutBuffer) -> dict:
-        T, E, N = buffer.T, buffer.E, buffer.N
+    def _update(
+        self,
+        actor_state: TrainState,
+        critic_state: TrainState,
+        traj: Transition,
+        advantages: jax.Array,
+        returns: jax.Array,
+        lr_actor: jax.Array,
+        lr_critic: jax.Array,
+    ) -> tuple[TrainState, TrainState, dict]:
+        t, e, n = traj.obs.shape[0], traj.obs.shape[1], traj.obs.shape[2]
+        flat = t * e * n
 
-        # Flatten (T, E, N, ...) → (T*E*N, ...) — each (t, e, i) triple is
-        # processed independently (truncated-BPTT-length-1 approximation).
-        obs_f  = buffer.obs.reshape(T * E * N, -1)
-        act_f  = buffer.actions.reshape(T * E * N, -1)
-        olp_f  = buffer.log_probs.reshape(T * E * N)
-        hx_f   = buffer.hx.reshape(T * E * N, -1)
+        # Each (t, e, i) triple is processed independently
+        # (truncated-BPTT-length-1 approximation).
+        obs_f = traj.obs.reshape(flat, -1)
+        act_f = traj.action.reshape(flat, -1)
+        old_log_prob = traj.log_prob.reshape(flat)
+        hx_f = traj.hx.reshape(flat, -1)
 
-        # Shared advantage: one value per (t, e), broadcast over N agents
-        adv = buffer.advantages                             # (T, E)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        adv_f = adv.unsqueeze(-1).expand(T, E, N).reshape(T * E * N)
+        # Shared advantage: one value per (t, e), broadcast over N agents.
+        adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        adv_f = jnp.broadcast_to(adv[:, :, None], (t, e, n)).reshape(flat)
 
-        ret = buffer.returns                                # (T, E)
+        states_f = traj.gstate.reshape(t * e, -1)
+        returns_f = returns.reshape(t * e)
 
-        a_losses, c_losses, ents = [], [], []
+        def actor_loss_fn(params):
+            mean, log_std, _ = self.actor.apply(params, obs_f, hx_f)
+            std = jnp.exp(log_std)
+            z = jnp.arctanh(jnp.clip(act_f, -1.0 + 1e-6, 1.0 - 1e-6))
+            log_prob = _tanh_normal_log_prob(z, mean, std, act_f)
 
-        for _ in range(self.n_epochs):
-            # ---- Actor ----
-            mean, log_std, _ = self.actor(obs_f, hx_f)
-            std  = log_std.exp().expand_as(mean)
-            dist = Normal(mean, std)
-            z    = torch.atanh(act_f.clamp(-1 + 1e-6, 1 - 1e-6))
-            nlp  = (dist.log_prob(z) - torch.log(1.0 - act_f.pow(2) + 1e-6)).sum(-1)
-
-            ratio = (nlp - olp_f).exp()
+            ratio = jnp.exp(log_prob - old_log_prob)
             surr1 = ratio * adv_f
-            surr2 = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_f
-            a_loss = -torch.min(surr1, surr2).mean()
-            ent    = dist.entropy().sum(-1).mean()
+            surr2 = jnp.clip(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_f
+            loss = -jnp.mean(jnp.minimum(surr1, surr2))
+            entropy = jnp.sum(_ENTROPY_CONST + log_std)
+            return loss - self.entropy_coef * entropy, (loss, entropy)
 
-            self.actor_opt.zero_grad()
-            (a_loss - self.entropy_coef * ent).backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            self.actor_opt.step()
+        def critic_loss_fn(params):
+            values = self.critic.apply(params, states_f).squeeze(-1)
+            return 0.5 * jnp.mean((values - returns_f) ** 2)
 
-            # ---- Critic ----
-            states_f = buffer.states.reshape(T * E, -1)              # (T*E, state_dim)
-            vals     = self.critic(states_f).squeeze(-1).reshape(T, E)  # (T, E)
-            c_loss   = 0.5 * ((vals - ret) ** 2).mean()
+        def epoch(carry, _):
+            a_state, c_state = carry
+            (_, (a_loss, entropy)), a_grads = jax.value_and_grad(
+                actor_loss_fn, has_aux=True
+            )(a_state.params)
+            a_state = _apply_gradients(a_state, a_grads, lr_actor)
 
-            self.critic_opt.zero_grad()
-            c_loss.backward()
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.critic_opt.step()
+            c_loss, c_grads = jax.value_and_grad(critic_loss_fn)(c_state.params)
+            c_state = _apply_gradients(c_state, c_grads, lr_critic)
+            return (a_state, c_state), (a_loss, c_loss, entropy)
 
-            a_losses.append(a_loss.item())
-            c_losses.append(c_loss.item())
-            ents.append(ent.item())
-
-        return {
-            'actor_loss':  float(np.mean(a_losses)),
-            'critic_loss': float(np.mean(c_losses)),
-            'entropy':     float(np.mean(ents)),
+        (actor_state, critic_state), (a_losses, c_losses, entropies) = jax.lax.scan(
+            epoch, (actor_state, critic_state), None, length=self.n_epochs
+        )
+        metrics = {
+            'actor_loss':  jnp.mean(a_losses),
+            'critic_loss': jnp.mean(c_losses),
+            'entropy':     jnp.mean(entropies),
         }
+        return actor_state, critic_state, metrics
+
+    def update(self, actor_state, critic_state, traj, advantages, returns,
+               lr_actor, lr_critic):
+        return self._update_fn(
+            actor_state, critic_state, traj, advantages, returns,
+            jnp.float32(lr_actor), jnp.float32(lr_critic),
+        )
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    @partial(jax.jit, static_argnums=(0,))
+    def act_deterministic(
+        self, actor_params, obs: jax.Array, hx: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """Greedy action tanh(mean) for evaluation. obs/hx are (B, ...)."""
+        mean, _, new_hx = self.actor.apply(actor_params, obs, hx)
+        return jnp.tanh(mean), new_hx

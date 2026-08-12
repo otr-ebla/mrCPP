@@ -1,122 +1,66 @@
 #!/usr/bin/env python3
-"""Entry point: train MAPPO agents on the indoor coverage task."""
+"""Entry point: train MAPPO agents on the indoor coverage task (JAX)."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import os
+import pickle
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
 
-from src.envs.vec_env import SubprocVecEnv
+from src.algorithms.mappo import MAPPO, RunningMeanStd, compute_gae
+from src.envs.vec_env import VecEnv
 from src.models.actor_critic_mlp import Actor, Critic
-from src.algorithms.mappo import MAPPO, RolloutBuffer
 from src.utils.config_parser import load_config
+from src.utils.jax_device import describe, select_device
 
 
-# ---------------------------------------------------------------------------
-# Observation normalisation (Welford online algorithm)
-# ---------------------------------------------------------------------------
-
-class RunningMeanStd:
-    """Tracks running mean and variance for online observation normalisation."""
-
-    def __init__(self, shape: tuple, eps: float = 1e-4):
-        self.mean  = np.zeros(shape, dtype=np.float64)
-        self.var   = np.ones(shape,  dtype=np.float64)
-        self.count = eps
-
-    def update(self, x: np.ndarray) -> None:
-        """x : (B, obs_dim) — a flat batch of observations."""
-        x = x.reshape(-1, *self.mean.shape)
-        batch_mean  = x.mean(axis=0)
-        batch_var   = x.var(axis=0)
-        batch_count = x.shape[0]
-        total       = self.count + batch_count
-        delta       = batch_mean - self.mean
-        self.mean   = self.mean + delta * batch_count / total
-        m_a         = self.var * self.count
-        m_b         = batch_var * batch_count
-        M2          = m_a + m_b + delta ** 2 * self.count * batch_count / total
-        self.var    = M2 / total
-        self.count  = total
-
-    def normalize(self, x: np.ndarray) -> np.ndarray:
-        """Normalise x: (..., obs_dim), preserving leading dimensions."""
-        orig = x.shape
-        out  = ((x.reshape(-1, self.mean.shape[0]) - self.mean)
-                / np.sqrt(self.var + 1e-8)).astype(np.float32)
-        return out.reshape(orig)
-
-    def state_dict(self) -> dict:
-        return {'mean': self.mean, 'var': self.var, 'count': self.count}
-
-    def load_state_dict(self, d: dict) -> None:
-        self.mean, self.var, self.count = d['mean'], d['var'], d['count']
+def linear_lr_decay(initial_lr: float, current_update: int, total_updates: int) -> float:
+    return initial_lr * max(0.0, 1.0 - current_update / total_updates)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def linear_lr_decay(
-    optimizer: torch.optim.Optimizer,
-    initial_lr: float,
-    current_update: int,
-    total_updates: int,
-) -> None:
-    frac = max(0.0, 1.0 - current_update / total_updates)
-    for group in optimizer.param_groups:
-        group['lr'] = initial_lr * frac
-
-
-def save_checkpoint(
-    path: str,
-    update: int,
-    actor: torch.nn.Module,
-    critic: torch.nn.Module,
-    mappo: MAPPO,
-    obs_rms: RunningMeanStd | None,
-) -> None:
+def save_checkpoint(path: str, update: int, actor_state, critic_state, rms) -> None:
     payload = {
-        'update':           update,
-        'actor_state':      actor.state_dict(),
-        'critic_state':     critic.state_dict(),
-        'actor_opt_state':  mappo.actor_opt.state_dict(),
-        'critic_opt_state': mappo.critic_opt.state_dict(),
+        'update':        update,
+        'actor_params':  jax.device_get(actor_state.params),
+        'critic_params': jax.device_get(critic_state.params),
+        'actor_opt':     jax.device_get(actor_state.opt_state),
+        'critic_opt':    jax.device_get(critic_state.opt_state),
+        'obs_rms':       jax.device_get(rms),
     }
-    if obs_rms is not None:
-        payload['obs_rms'] = obs_rms.state_dict()
-    torch.save(payload, path)
+    with open(path, 'wb') as f:
+        pickle.dump(payload, f)
 
 
-def load_checkpoint(
-    path: str,
-    actor: torch.nn.Module,
-    critic: torch.nn.Module,
-    mappo: MAPPO,
-    obs_rms: RunningMeanStd | None,
-) -> int:
-    ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    actor.load_state_dict(ckpt['actor_state'])
-    critic.load_state_dict(ckpt['critic_state'])
-    mappo.actor_opt.load_state_dict(ckpt['actor_opt_state'])
-    mappo.critic_opt.load_state_dict(ckpt['critic_opt_state'])
-    if obs_rms is not None and 'obs_rms' in ckpt:
-        obs_rms.load_state_dict(ckpt['obs_rms'])
-    return int(ckpt['update'])
+def load_checkpoint(path: str, actor_state, critic_state, device):
+    with open(path, 'rb') as f:
+        ckpt = pickle.load(f)
+    actor_state = actor_state.replace(
+        params=jax.device_put(ckpt['actor_params'], device),
+        opt_state=jax.device_put(ckpt['actor_opt'], device),
+    )
+    critic_state = critic_state.replace(
+        params=jax.device_put(ckpt['critic_params'], device),
+        opt_state=jax.device_put(ckpt['critic_opt'], device),
+    )
+    rms = RunningMeanStd(*jax.device_put(tuple(ckpt['obs_rms']), device))
+    return actor_state, critic_state, rms, int(ckpt['update'])
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(config_path: str, save_dir: str, resume: str | None) -> tuple:
+def train(config_path: str, save_dir: str, resume: str | None, backend: str | None = None):
     config = load_config(config_path)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    # Must run before any array is created so implicit placement follows the
+    # selected backend: Metal on Apple Silicon, else CUDA, else CPU.
+    device = select_device(backend)
+    print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
 
     env_cfg   = config.get('env',   {})
     model_cfg = config.get('model', {})
@@ -124,12 +68,12 @@ def train(config_path: str, save_dir: str, resume: str | None) -> tuple:
 
     num_envs = train_cfg.get('num_envs', 4)
 
-    vec_env   = SubprocVecEnv(num_envs, env_cfg)
-    E         = vec_env.E
-    N         = vec_env.num_robots
-    obs_dim   = vec_env.obs_dim
-    state_dim = vec_env.state_dim
-    action_dim = 2
+    vec_env    = VecEnv(num_envs, env_cfg)
+    E          = vec_env.E
+    N          = vec_env.num_robots
+    obs_dim    = vec_env.obs_dim
+    state_dim  = vec_env.state_dim
+    action_dim = vec_env.action_dim
 
     print(f"Parallel envs: {E}  |  robots/env: {N}  |  "
           f"obs_dim: {obs_dim}  |  state_dim: {state_dim}")
@@ -138,14 +82,13 @@ def train(config_path: str, save_dir: str, resume: str | None) -> tuple:
     gru_hidden    = model_cfg.get('gru_hidden',    128)
     critic_hidden = model_cfg.get('critic_hidden', 256)
 
-    actor  = Actor(obs_dim, action_dim, hidden_size, gru_hidden)
-    critic = Critic(state_dim, critic_hidden)
-    mappo  = MAPPO(actor, critic, train_cfg, device=str(device))
+    actor  = Actor(action_dim, hidden_size, gru_hidden)
+    critic = Critic(critic_hidden)
+    mappo  = MAPPO(actor, critic, vec_env, train_cfg, device=device)
 
     T             = train_cfg.get('rollout_steps',  256)
     total_updates = train_cfg.get('total_updates',  3000)
     log_interval  = train_cfg.get('log_interval',   10)
-    save_interval = train_cfg.get('save_interval',  100)
     gamma         = train_cfg.get('gamma',          0.99)
     gae_lambda    = train_cfg.get('gae_lambda',     0.95)
     normalize_obs = train_cfg.get('normalize_obs',  True)
@@ -153,139 +96,109 @@ def train(config_path: str, save_dir: str, resume: str | None) -> tuple:
     lr_actor_0    = train_cfg.get('lr_actor',       3e-4)
     lr_critic_0   = train_cfg.get('lr_critic',      1e-3)
 
-    buffer  = RolloutBuffer(T, E, N, obs_dim, state_dim, action_dim,
-                            gru_hidden, torch.device(str(device)))
-    obs_rms = RunningMeanStd(shape=(obs_dim,)) if normalize_obs else None
+    key = jax.random.PRNGKey(train_cfg.get('seed', 0))
+    key, init_key, reset_key = jax.random.split(key, 3)
+
+    actor_state, critic_state = mappo.create_train_states(init_key)
+    carry = mappo.init_carry(reset_key)
 
     os.makedirs(save_dir, exist_ok=True)
     log_path = os.path.join(save_dir, 'training_log.csv')
 
     start_update = 1
     if resume:
-        start_update = load_checkpoint(resume, actor, critic, mappo, obs_rms) + 1
+        actor_state, critic_state, rms, last = load_checkpoint(
+            resume, actor_state, critic_state, device
+        )
+        carry = carry._replace(rms=rms)
+        start_update = last + 1
         print(f"Resumed from {resume}, continuing at update {start_update}")
 
     with open(log_path, 'w', newline='') as f:
         csv.writer(f).writerow(['update', 'episodes', 'mean_ep_reward',
-                                 'coverage_ratio', 'actor_loss', 'critic_loss', 'entropy'])
+                                'coverage_ratio', 'actor_loss', 'critic_loss', 'entropy'])
 
-    # -- Initial state --
-    obs, state, info_list = vec_env.reset()
-    # hx: (E, N, gru_hidden) — one hidden state per env × agent
-    hx = actor.init_hidden(E * N, device=str(device)).reshape(E, N, -1)
-
-    ep_reward   = np.zeros(E, dtype=np.float64)   # per-env accumulator
+    ep_reward = np.zeros(E, dtype=np.float64)   # per-env accumulator
     ep_rewards: list[float] = []
-    ep_count    = 0
-    last_infos  = info_list
+    ep_count = 0
     best_mean_reward = -np.inf
 
     for update in range(start_update, total_updates + 1):
-
-        if lr_decay:
-            linear_lr_decay(mappo.actor_opt,  lr_actor_0,  update, total_updates)
-            linear_lr_decay(mappo.critic_opt, lr_critic_0, update, total_updates)
+        lr_a = linear_lr_decay(lr_actor_0,  update, total_updates) if lr_decay else lr_actor_0
+        lr_c = linear_lr_decay(lr_critic_0, update, total_updates) if lr_decay else lr_critic_0
 
         # ----------------------------------------------------------------
-        # Collect T environment steps across all E envs
+        # Collect T environment steps across all E envs in a single call
         # ----------------------------------------------------------------
-        for _ in range(T):
-            if obs_rms is not None:
-                obs_rms.update(obs.reshape(E * N, obs_dim))
-                obs_in = obs_rms.normalize(obs)   # (E, N, obs_dim)
-            else:
-                obs_in = obs
+        key, rollout_key = jax.random.split(key)
+        prev_rms = carry.rms
+        carry, traj, last_value = mappo.rollout(
+            actor_state.params, critic_state.params, carry, T, rollout_key
+        )
+        if not normalize_obs:
+            carry = carry._replace(rms=prev_rms)
 
-            actions, log_probs, values, new_hx = mappo.get_actions(obs_in, state, hx)
-            # actions : (E, N, 2)   log_probs : (E, N)
-            # values  : (E,)        new_hx    : (E, N, gru_hidden)
-
-            next_obs, rewards, terms, dones, last_infos, next_state = vec_env.step(actions)
-            # next_obs : (E, N, obs_dim)   rewards : (E, N)
-            # terms    : (E,) bool — collision termination (GAE mask)
-            # dones    : (E,) bool — any episode end (hx reset)
-            # next_state : (E, state_dim)
-
-            buffer.insert(
-                torch.from_numpy(obs_in).float().to(device),
-                torch.from_numpy(state).float().to(device),
-                torch.from_numpy(actions).float().to(device),
-                log_probs.to(device),
-                torch.from_numpy(rewards).float().to(device),
-                values.to(device),
-                # GAE masking: only zero the bootstrap on hard termination (collision).
-                # Timeout (truncation) still bootstraps — V(s_{timeout}) is meaningful.
-                torch.from_numpy(terms.astype(np.float32)).to(device),
-                hx,
-            )
-
-            ep_reward += rewards.mean(axis=-1)   # (E,) — per-env mean agent reward
-            for e in range(E):
-                if dones[e]:
-                    ep_rewards.append(float(ep_reward[e]))
-                    ep_reward[e] = 0.0
-                    ep_count    += 1
-
-            obs   = next_obs
-            state = next_state
-            # Zero hx for ALL episode endings (collision or timeout)
-            done_mask = torch.from_numpy(dones.astype(np.float32)).to(device)  # (E,)
-            hx = new_hx * (1.0 - done_mask[:, None, None])
-
-        # ----------------------------------------------------------------
-        # Bootstrap: V(s_T) for each env
-        # ----------------------------------------------------------------
-        if obs_rms is not None:
-            obs_in_last = obs_rms.normalize(obs)
-        else:
-            obs_in_last = obs
-        _, _, last_values, _ = mappo.get_actions(obs_in_last, state, hx)
-        buffer.compute_returns(last_values.to(device), gamma, gae_lambda)
+        advantages, returns = compute_gae(traj, last_value, gamma, gae_lambda)
 
         # ----------------------------------------------------------------
         # Policy update
         # ----------------------------------------------------------------
-        losses = mappo.update(buffer)
+        actor_state, critic_state, metrics = mappo.update(
+            actor_state, critic_state, traj, advantages, returns, lr_a, lr_c
+        )
+
+        # ----------------------------------------------------------------
+        # Episode bookkeeping (host-side, from the stacked rollout)
+        # ----------------------------------------------------------------
+        team_rewards = np.asarray(jnp.mean(traj.reward, axis=-1))   # (T, E)
+        dones = np.asarray(traj.done)                               # (T, E)
+        for t in range(T):
+            ep_reward += team_rewards[t]
+            finished = np.nonzero(dones[t])[0]
+            for e in finished:
+                ep_rewards.append(float(ep_reward[e]))
+                ep_reward[e] = 0.0
+                ep_count += 1
 
         # ----------------------------------------------------------------
         # Logging
         # ----------------------------------------------------------------
         if update % log_interval == 0:
-            window    = ep_rewards[-20:] if ep_rewards else [0.0]
+            window = ep_rewards[-20:] if ep_rewards else [0.0]
             mean_ep_r = float(np.mean(window))
-            last_cov  = float(np.mean([i['coverage_ratio'] for i in last_infos]))
+            last_cov = float(np.asarray(traj.coverage)[-1].mean())
+            losses = jax.device_get(metrics)
             print(
                 f"Update {update:5d}/{total_updates} | "
                 f"episodes={ep_count:6d} | "
                 f"mean_ep_r={mean_ep_r:8.3f} | "
                 f"coverage={last_cov:.2%} | "
-                f"actor={losses['actor_loss']:7.4f} | "
-                f"critic={losses['critic_loss']:7.4f} | "
-                f"entropy={losses['entropy']:6.4f}"
+                f"actor={float(losses['actor_loss']):7.4f} | "
+                f"critic={float(losses['critic_loss']):7.4f} | "
+                f"entropy={float(losses['entropy']):6.4f}"
             )
             with open(log_path, 'a', newline='') as f:
                 csv.writer(f).writerow([
                     update, ep_count, round(mean_ep_r, 4),
                     round(last_cov, 4),
-                    round(losses['actor_loss'],  4),
-                    round(losses['critic_loss'], 4),
-                    round(losses['entropy'],     4),
+                    round(float(losses['actor_loss']),  4),
+                    round(float(losses['critic_loss']), 4),
+                    round(float(losses['entropy']),     4),
                 ])
             if ep_count > 0 and mean_ep_r > best_mean_reward:
                 best_mean_reward = mean_ep_r
-                best_path = os.path.join(save_dir, 'checkpoint_final.pt')
-                save_checkpoint(best_path, update, actor, critic, mappo, obs_rms)
+                save_checkpoint(os.path.join(save_dir, 'checkpoint_final.pkl'),
+                                update, actor_state, critic_state, carry.rms)
                 print(f"  → best policy saved (mean_ep_r={mean_ep_r:.3f})")
 
-    save_checkpoint(os.path.join(save_dir, 'checkpoint_final.pt'),
-                    total_updates, actor, critic, mappo, obs_rms)
-    vec_env.close()
-    return actor, critic, obs_rms
+    save_checkpoint(os.path.join(save_dir, 'checkpoint_final.pkl'),
+                    total_updates, actor_state, critic_state, carry.rms)
+    return actor_state, critic_state, carry.rms
 
 
 if __name__ == '__main__':
     _default_cfg  = os.path.join(os.path.dirname(__file__), '..', 'config',
-                                  'mappo_baseline.yaml')
+                                 'mappo_baseline.yaml')
     _default_save = os.path.join(os.path.dirname(__file__), '..', 'checkpoints')
 
     parser = argparse.ArgumentParser(description='Train MAPPO for indoor coverage')
@@ -295,5 +208,10 @@ if __name__ == '__main__':
                         help='Directory for checkpoints and training log')
     parser.add_argument('--resume',   default=None,
                         help='Checkpoint path to resume from')
+    parser.add_argument('--backend',  default='auto',
+                        choices=['auto', 'metal', 'cuda', 'gpu', 'cpu'],
+                        help='Force a JAX backend. Default "auto": Metal on Apple '
+                             'Silicon, else CUDA when an NVIDIA GPU is present, else CPU')
     args = parser.parse_args()
-    train(args.config, args.save_dir, args.resume)
+    backend = None if args.backend == 'auto' else args.backend
+    train(args.config, args.save_dir, args.resume, backend)

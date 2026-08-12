@@ -85,6 +85,6 @@ architectural ambition:
 ## Implementation Constraints
 
 - All modeling and training code (encoder, Mamba SSM world model, actor, critic,
-  imagination rollouts) must be implemented in **JAX**, targeting **CUDA** execution.
+  imagination rollouts) must be implemented in **JAX**, targeting **CUDA** execution, if the current machine has an NVIDIA GPU on, **JAX-METAL** if the code is running on a macbook with apple silicon M1/M2/M3/M4, **CPU** in all other cases. All code implementations are intended to run as fast as possible on the machine used.
 - Code must be lean: no unnecessary comments, no dead code, no speculative
   abstractions ahead of what a given experiment needs.
