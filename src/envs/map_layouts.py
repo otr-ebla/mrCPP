@@ -9,9 +9,19 @@ class IndoorMapLayout:
         self.width = 12.0
         self.height = 8.0
 
-        # Wall thicknesses
+        # Wall thicknesses.
+        # Inner walls run along cell boundaries (x=4.0, x=6.0, y=4.0), so the
+        # nearest cell centres sit 0.5*cell_size = 0.25 m away. A cell counts as
+        # coverable only if the robot body (radius 0.20 m) fits at its centre, so
+        # the inner half-thickness must stay below 0.25 - 0.20 = 0.05 m; anything
+        # thicker sterilises the two cell lines flanking every inner wall. 0.08 m
+        # total keeps a 0.01 m margin against floating-point ties.
+        # The outer walls sit entirely outside [0, width] x [0, height], so their
+        # thickness never eats into the play area and is left as-is.
         outer_t = 0.20
-        inner_t = 0.15
+        inner_t = 0.08
+        self.outer_t = outer_t
+        self.inner_t = inner_t
 
         self.walls = []
 
@@ -35,15 +45,19 @@ class IndoorMapLayout:
         x_l = x_left_wall - (inner_t / 2)
         x_r = x_left_wall + (inner_t / 2)
 
+        y_mid_wall = 4.0
+        y_b = y_mid_wall - (inner_t / 2)
+        y_t = y_mid_wall + (inner_t / 2)
+
         self.walls.append([x_l, 0.2, x_r, 1.2])
-        self.walls.append([x_l, 2.2, x_r, 3.925])
-        self.walls.append([x_l, 4.075, x_r, 5.0])
+        self.walls.append([x_l, 2.2, x_r, y_b])
+        self.walls.append([x_l, y_t, x_r, 5.0])
         self.walls.append([x_l, 6.0, x_r, 7.8])
 
         # ---------------------------------------------------------
         # 3. INNER WALL: HORIZONTAL SPLIT FOR LEFT ROOMS (At y=4.0)
         # ---------------------------------------------------------
-        self.walls.append([0.2, 4.0 - (inner_t / 2), 3.925, 4.0 + (inner_t / 2)])
+        self.walls.append([0.2, y_b, x_l, y_t])
 
         # ---------------------------------------------------------
         # 4. INNER WALL: RIGHT HALLWAY SEPARATOR (Vertical split at x=6.0)
@@ -59,12 +73,8 @@ class IndoorMapLayout:
         # ---------------------------------------------------------
         # 5. INNER WALL: HORIZONTAL DIVIDER WITH DOOR IN BIG RIGHT ROOM (At y=4.0)
         # ---------------------------------------------------------
-        y_mid_wall = 4.0
-        y_b = y_mid_wall - (inner_t / 2)
-        y_t = y_mid_wall + (inner_t / 2)
-
         # Two segments leave a 1.0 m gap (door opening) between x=8.5 and x=9.5
-        self.walls.append([6.075, y_b, 8.5, y_t])
+        self.walls.append([x_rr, y_b, 8.5, y_t])
         self.walls.append([9.5, y_b, 11.8, y_t])
 
     def get_walls(self):

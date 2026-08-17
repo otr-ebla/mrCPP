@@ -65,6 +65,11 @@ class EnvState:
     robot_alive:      jax.Array   # (N,)     bool
     step_count:       jax.Array   # ()       int32
     key:              jax.Array   # PRNG key carried for auto-reset
+    # Diagnostics for the step that produced this state, kept in the state so
+    # `get_info` can report them without changing the `step` signature. float32
+    # rather than bool: jax-metal 0.1.1 drops bool leaves out of `lax.scan`.
+    wall_hits:        jax.Array   # (N,)     float32  — 0.0 / 1.0
+    robot_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
 
 
 @struct.dataclass
@@ -169,8 +174,10 @@ class MultiRobotCoverageEnv:
             raise RuntimeError("Free space is too small for the requested robot count.")
 
         # -- Room definitions: 5 bounding boxes matching the map layout --
-        outer_t = 0.20
-        inner_t = 0.15
+        # Taken from the layout rather than restated, so a change of wall
+        # thickness cannot silently desynchronise the room boxes from the walls.
+        outer_t = self.map_layout.outer_t
+        inner_t = self.map_layout.inner_t
         x_left  = 4.0
         x_right = 6.0
         W, H    = self.map_layout.width, self.map_layout.height
@@ -432,6 +439,8 @@ class MultiRobotCoverageEnv:
             robot_alive      = jnp.ones((self.num_robots,), bool),
             step_count       = jnp.int32(0),
             key              = key,
+            wall_hits        = jnp.zeros((self.num_robots,), jnp.float32),
+            robot_hits       = jnp.zeros((self.num_robots,), jnp.float32),
         )
 
     # ------------------------------------------------------------------
@@ -575,6 +584,8 @@ class MultiRobotCoverageEnv:
             room_completed   = room_completed,
             robot_alive      = alive_next,
             step_count       = step_count,
+            wall_hits        = wall_hit.astype(jnp.float32),
+            robot_hits       = robot_hit.astype(jnp.float32),
         )
         return next_state, rewards, terminated, truncated
 
@@ -692,6 +703,16 @@ class MultiRobotCoverageEnv:
             'step':             state.step_count,
             'robots_alive':     state.robot_alive,
             'num_robots_alive': jnp.sum(state.robot_alive),
+            # Fraction of the team that collided on the step leading to this
+            # state, split by cause (the two are mutually exclusive: a robot
+            # blocked by a wall is excluded from the pairwise test).
+            'wall_collision_rate':  jnp.mean(state.wall_hits),
+            'robot_collision_rate': jnp.mean(state.robot_hits),
+            # Episode-end causes, as 0/1 floats so they survive vmap/scan and can
+            # be averaged directly into rates. `complete` mirrors the termination
+            # test in `step`; `timeout` mirrors the truncation test.
+            'complete':         (covered >= self.free_total - 0.5).astype(jnp.float32),
+            'timeout':          (state.step_count >= self.max_steps).astype(jnp.float32),
         }
         for ri in range(self.num_rooms):
             info[f'room_{ri}_ratio'] = room_cov[ri] / jnp.maximum(self.room_totals[ri], 1.0)

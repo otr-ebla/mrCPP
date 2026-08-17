@@ -49,6 +49,18 @@ The project evaluates architectures in increasing order of complexity:
 > because the networks are small and the rollout is dominated by many tiny
 > kernel dispatches. Prefer `--backend cpu` on Mac unless you scale the model up.
 
+* **Monitoring:** training streams to **Weights & Biases** (configured in the
+  `wandb:` block of the YAML, overridable with `--wandb-project`, `--wandb-name`,
+  `--wandb-mode {online,offline,disabled}`, or switched off with `--no-wandb`).
+  Run `wandb login` once first. The same metrics are always written to
+  `<save-dir>/training_log.csv`, and a failed W&B init never stops training.
+
+  Logged per `log_interval`: episode reward / coverage / length, the end-cause
+  rates (`rate/completion`, `rate/timeout`, `rate/collision_end`), collision
+  diagnostics split by cause (`collision/wall_*`, `collision/robot_*`, both as a
+  per-robot-step rate and as a per-episode count), the PPO losses, policy sigma
+  and the decayed learning rates.
+
 ---
 
 ## 🚀 Getting Started

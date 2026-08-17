@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Visualise a trained MAPPO policy in real time using pygame (JAX).
+"""Visualise a coverage controller in real time using pygame (JAX).
+
+Two controllers are available: the trained MAPPO policy, and BOSCO, the
+deterministic boustrophedon expert used to generate imitation-learning data.
+Under BOSCO each cell is painted in the colour of the robot that owns it after
+the initial partition, so the division of the map is visible at a glance.
 
 Usage (from the project root):
     python -m src.test_visual
     python -m src.test_visual --checkpoint checkpoints/checkpoint_final.pkl --episodes 10
+    python -m src.test_visual --policy bosco
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ if _ROOT not in sys.path:
 import jax
 import jax.numpy as jnp
 
+from src.algorithms.bosco import BoscoExpert
 from src.algorithms.mappo import RunningMeanStd, rms_normalize
 from src.envs.coverage_vector_env import MultiRobotCoverageEnv
 from src.models.actor_critic import Actor
@@ -39,6 +46,9 @@ SCALE      = 80   # pixels per metre
 MARGIN     = 40   # pixel border around the map
 HUD_HEIGHT = 50   # pixels for the stats bar at the bottom
 FPS        = 30
+
+# Step budget BOSCO needs to finish the default map; see src/algorithms/bosco.py.
+_BOSCO_MIN_STEPS = 3000
 
 # One colour per robot (cycles if more than 4)
 _ROBOT_COLORS = [
@@ -67,6 +77,28 @@ def _to_px(x: float, y: float, map_h: float) -> tuple[int, int]:
     """World metres → pygame pixel (top-left origin, y-axis flipped)."""
     return (int(x * SCALE) + MARGIN,
             int((map_h - y) * SCALE) + MARGIN)
+
+
+def _ownership_palette(num_robots: int) -> np.ndarray:
+    """(R+1, 2, 3) uint8 lookup: [owner, covered] → cell colour.
+
+    Row `num_robots` is the unowned fallback, so the table can be indexed with
+    the raw owner id after mapping -1 onto it — no per-cell branching while
+    drawing. Owned cells drop the shared green entirely: a robot's territory
+    reads as a pale wash of its own colour while pending, and as a strong tint
+    of it once swept, which keeps "who owns this" and "is it done" legible in
+    the same square.
+    """
+    white     = np.array((255, 255, 255), dtype=float)
+    uncovered = np.array(COLORS['uncovered'], dtype=float)
+    lut = np.empty((num_robots + 1, 2, 3), dtype=float)
+    lut[num_robots, 0] = uncovered
+    lut[num_robots, 1] = COLORS['covered']
+    for r in range(num_robots):
+        c = np.array(_ROBOT_COLORS[r % len(_ROBOT_COLORS)], dtype=float)
+        lut[r, 0] = 0.80 * uncovered + 0.20 * c
+        lut[r, 1] = 0.30 * white     + 0.70 * c
+    return lut.astype(np.uint8)
 
 
 def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
@@ -110,6 +142,9 @@ def _draw_frame(
     font: pygame.font.Font,
     ep_reward: float,
     show_lidar: bool,
+    owner: np.ndarray | None = None,
+    palette: np.ndarray | None = None,
+    label: str = '',
 ) -> None:
     mw = env.map_layout.width
     mh = env.map_layout.height
@@ -124,10 +159,13 @@ def _draw_frame(
     cell_px = int(cs * SCALE)
     grid = snap['coverage_grid']
     free = env.free_mask_np
+    show_owner = owner is not None and palette is not None
     for row in range(env.grid_h):
         for col in range(env.grid_w):
             if free[row, col] == 0.0:
                 color = COLORS['unreachable']
+            elif show_owner:
+                color = palette[owner[row, col], int(grid[row, col] > 0.0)]
             else:
                 color = COLORS['covered'] if grid[row, col] > 0.0 else COLORS['uncovered']
             px, py = _to_px(col * cs, (row + 1) * cs, mh)
@@ -181,6 +219,10 @@ def _draw_frame(
         color  = (_ROBOT_COLORS[i % len(_ROBOT_COLORS)] if snap['alive'][i]
                   else COLORS['dead'])
         pygame.draw.circle(surface, color, (cx, cy), r_px)
+        # Against its own territory tint a bare disc loses its edge, so it keeps
+        # a dark rim whenever the ownership overlay is on.
+        if show_owner:
+            pygame.draw.circle(surface, COLORS['border'], (cx, cy), r_px, 2)
         tip_x = cx + int(r_px * 1.8 * np.cos(hdg))
         tip_y = cy - int(r_px * 1.8 * np.sin(hdg))
         pygame.draw.line(surface, (255, 255, 255), (cx, cy), (tip_x, tip_y), 2)
@@ -189,56 +231,129 @@ def _draw_frame(
         surface.blit(lbl, (cx - lbl.get_width() // 2, cy - lbl.get_height() // 2))
 
     # -- HUD --
-    text = (f"  Step {snap['step']:4d}/{env.max_steps}  |  "
-            f"Coverage {snap['coverage_ratio']:.1%} "
-            f"({snap['covered_cells']}/{snap['total_cells']})  |  "
-            f"Ep Reward {ep_reward:8.2f}  |  "
-            f"[ESC] quit  [R] reset  [L] lidar")
     win_h = surface.get_height()
     pygame.draw.rect(
         surface, COLORS['hud_bg'],
         pygame.Rect(0, win_h - HUD_HEIGHT, surface.get_width(), HUD_HEIGHT),
     )
+    # Kept to ~107 monospace columns so the key hints survive at the default
+    # window width (map width * SCALE + margins).
+    text = (f"  {label} Step {snap['step']:4d}/{env.max_steps} | "
+            f"Coverage {snap['coverage_ratio']:5.1%} "
+            f"({snap['covered_cells']}/{snap['total_cells']}) | "
+            f"Reward {ep_reward:8.2f} | "
+            f"[ESC] quit [R] reset [L] lidar [O] owners")
     rendered = font.render(text, True, COLORS['hud_text'])
-    surface.blit(rendered, (8, win_h - HUD_HEIGHT + (HUD_HEIGHT - rendered.get_height()) // 2))
+    line_h = rendered.get_height()
+    top = win_h - HUD_HEIGHT + (HUD_HEIGHT - (2 * line_h if show_owner else line_h)) // 2
+    surface.blit(rendered, (8, top))
+
+    # Second line: how much of each robot's own region it has swept. Region
+    # sizes differ — the wavefront balances area but connectivity bounds it —
+    # so the per-robot fraction says more than the team total alone.
+    if show_owner:
+        done = grid > 0.0
+        x = 8
+        parts = font.render("  Regions:", True, COLORS['hud_text'])
+        surface.blit(parts, (x, top + line_h))
+        x += parts.get_width()
+        for i in range(env.num_robots):
+            mine = owner == i
+            total = int(mine.sum())
+            swept = int((mine & done).sum())
+            frac = swept / total if total else 1.0
+            chunk = font.render(f"  {i}: {swept:3d}/{total:3d} ({frac:4.0%})", True,
+                                _ROBOT_COLORS[i % len(_ROBOT_COLORS)])
+            surface.blit(chunk, (x, top + line_h))
+            x += chunk.get_width()
 
 
-def _build_policy_fn(env: MultiRobotCoverageEnv, actor: Actor):
-    """One jitted call per frame: normalise obs → greedy action → env step.
+class MappoController:
+    """Trained policy. One jitted call per frame: normalise → act → step.
 
     Fusing the policy and the environment transition keeps a single device
     round-trip per rendered frame; only the render snapshot comes back.
     """
 
-    @jax.jit
-    def policy_step(params, rms, state, obs):
-        obs_n = rms_normalize(rms, obs) if rms is not None else obs
-        mean, _ = actor.apply(params, obs_n)
-        action = jnp.tanh(mean)                       # deterministic
-        next_state, rewards, terminated, truncated = env.step(state, action)
-        return next_state, env.get_obs(next_state), rewards, terminated, truncated
+    label = 'MAPPO '
+    owner = None          # no partition to show
 
-    return policy_step
+    def __init__(self, env: MultiRobotCoverageEnv, actor: Actor, params,
+                 obs_rms: RunningMeanStd | None):
+        self.env, self.params, self.obs_rms = env, params, obs_rms
+
+        @jax.jit
+        def policy_step(params, rms, state, obs):
+            obs_n = rms_normalize(rms, obs) if rms is not None else obs
+            mean, _ = actor.apply(params, obs_n)
+            action = jnp.tanh(mean)                   # deterministic
+            next_state, rewards, terminated, truncated = env.step(state, action)
+            return next_state, env.get_obs(next_state), rewards, terminated, truncated
+
+        self._fn = policy_step
+
+    def reset(self, state) -> None:
+        self.obs = self.env.get_obs(state)
+
+    def step(self, state, snap: dict):
+        state, self.obs, rewards, terminated, truncated = self._fn(
+            self.params, self.obs_rms, state, self.obs
+        )
+        return state, rewards, terminated, truncated
+
+
+class BoscoController:
+    """Deterministic boustrophedon expert, driven from the render snapshot.
+
+    `BoscoExpert` is a host-side numpy planner, and the snapshot already pulls
+    exactly the three arrays it reads — poses and the coverage grid — back for
+    drawing, so feeding it the snapshot adds no device round-trip of its own.
+    """
+
+    label = 'BOSCO '
+
+    def __init__(self, env: MultiRobotCoverageEnv):
+        self.env = env
+        self.expert = BoscoExpert(env)
+        self._step = jax.jit(env.step)
+        self.owner = None
+
+    def reset(self, state) -> None:
+        info = self.expert.reset(np.asarray(state.robot_positions))
+        # -1 (unowned) folds onto the palette's trailing fallback row.
+        owner = self.expert.owner.copy()
+        owner[owner < 0] = self.env.num_robots
+        self.owner = owner.reshape(self.env.grid_h, self.env.grid_w)
+        print(f"  partition {info['region_sizes'].tolist()}", end='', flush=True)
+
+    def step(self, state, snap: dict):
+        actions = self.expert.act(
+            snap['positions'], snap['headings'], snap['coverage_grid']
+        )
+        state, rewards, terminated, truncated = self._step(state, jnp.asarray(actions))
+        return state, rewards, terminated, truncated
 
 
 def run_episode(
     env: MultiRobotCoverageEnv,
-    policy_step,
-    params,
-    obs_rms: RunningMeanStd | None,
+    controller,
     key: jax.Array,
     surface: pygame.Surface,
     clock: pygame.time.Clock,
     font: pygame.font.Font,
     walls: np.ndarray,
+    palette: np.ndarray,
     fps: int,
     view_state: dict,
 ) -> float | None:
     """Run one episode. Returns total reward, or None if the user quit."""
     state = env.reset(key)
-    obs   = env.get_obs(state)
+    controller.reset(state)
 
     ep_reward = 0.0
+    # The snapshot is taken before the step rather than after it, so the same
+    # host arrays serve both the renderer and a host-side controller.
+    snap = _snapshot(env, state, view_state['show_lidar'])
 
     while True:
         for event in pygame.event.get():
@@ -251,18 +366,23 @@ def run_episode(
                     return ep_reward   # early reset
                 if event.key == pygame.K_l:
                     view_state['show_lidar'] = not view_state['show_lidar']
+                if event.key == pygame.K_o:
+                    view_state['show_owner'] = not view_state['show_owner']
 
-        state, obs, rewards, terminated, truncated = policy_step(
-            params, obs_rms, state, obs
-        )
-        ep_reward += float(jnp.mean(rewards))
-
-        snap = _snapshot(env, state, view_state['show_lidar'])
-        _draw_frame(surface, env, walls, snap, font, ep_reward, view_state['show_lidar'])
+        owner = controller.owner if view_state['show_owner'] else None
+        _draw_frame(surface, env, walls, snap, font, ep_reward,
+                    view_state['show_lidar'], owner, palette, controller.label)
         pygame.display.flip()
         clock.tick(fps)
 
+        state, rewards, terminated, truncated = controller.step(state, snap)
+        ep_reward += float(jnp.mean(rewards))
+        snap = _snapshot(env, state, view_state['show_lidar'])
+
         if bool(terminated) or bool(truncated):
+            _draw_frame(surface, env, walls, snap, font, ep_reward,
+                        view_state['show_lidar'], owner, palette, controller.label)
+            pygame.display.flip()
             return ep_reward
 
 
@@ -296,7 +416,13 @@ def main() -> None:
     _default_cfg  = os.path.join(_ROOT, 'config', 'mappo_baseline.yaml')
     _default_ckpt = os.path.join(_ROOT, 'checkpoints', 'checkpoint_final.pkl')
 
-    parser = argparse.ArgumentParser(description='Visualise trained MAPPO policy with pygame')
+    parser = argparse.ArgumentParser(description='Visualise a coverage controller with pygame')
+    parser.add_argument('--policy',     default='mappo', choices=['mappo', 'bosco'],
+                        help='Controller to run: the trained MAPPO policy, or the '
+                             'deterministic BOSCO expert (default: mappo)')
+    parser.add_argument('--max-steps',  type=int, default=0,
+                        help='Override the episode step limit; 0 = take it from the '
+                             'config (default: 0)')
     parser.add_argument('--checkpoint', default=_default_ckpt,
                         help='Path to .pkl checkpoint (default: checkpoints/checkpoint_final.pkl)')
     parser.add_argument('--config',     default=_default_cfg,
@@ -324,30 +450,44 @@ def main() -> None:
     device = select_device(None if args.backend == 'auto' else args.backend)
     print(f"Device: {describe(device)}")
 
+    if args.max_steps > 0:
+        env_cfg = {**env_cfg, 'max_steps': args.max_steps}
+    elif args.policy == 'bosco' and env_cfg.get('max_steps', 500) < _BOSCO_MIN_STEPS:
+        # A full BOSCO sweep of the default map takes ~2100 steps; the training
+        # config truncates long before that, which would look like the expert
+        # failing rather than the clock running out.
+        print(f"Raising max_steps {env_cfg.get('max_steps')} → {_BOSCO_MIN_STEPS} "
+              "so the sweep can finish (override with --max-steps).")
+        env_cfg = {**env_cfg, 'max_steps': _BOSCO_MIN_STEPS}
+
     env   = MultiRobotCoverageEnv(env_cfg)
     walls = np.asarray(env.walls)
 
-    actor = Actor(
-        action_dim=env.action_dim,
-        vec_dim=env.obs_vec_dim,
-        n_rays=env.n_rays,
-        patch_dim=env.patch_dim,
-        lidar_embed=model_cfg.get('lidar_embed',  64),
-        hidden_size=model_cfg.get('hidden_size', 128),
-    )
-
-    params, obs_rms, update = _load_checkpoint(args.checkpoint, device)
-    print(f"Loaded: {args.checkpoint}  (update {update})")
-
-    if args.no_obs_norm or not train_cfg.get('normalize_obs', True):
-        obs_rms = None
-        print("Observation normalisation: disabled.")
-    elif obs_rms is None:
-        print("Warning: checkpoint has no obs_rms — running without normalisation.")
+    if args.policy == 'bosco':
+        controller = BoscoController(env)
+        print(f"Controller: BOSCO (deterministic, {env.num_robots} robots)")
     else:
-        print("Observation normalisation: loaded from checkpoint.")
+        actor = Actor(
+            action_dim=env.action_dim,
+            vec_dim=env.obs_vec_dim,
+            n_rays=env.n_rays,
+            patch_dim=env.patch_dim,
+            lidar_embed=model_cfg.get('lidar_embed',  64),
+            hidden_size=model_cfg.get('hidden_size', 128),
+        )
 
-    policy_step = _build_policy_fn(env, actor)
+        params, obs_rms, update = _load_checkpoint(args.checkpoint, device)
+        print(f"Loaded: {args.checkpoint}  (update {update})")
+
+        if args.no_obs_norm or not train_cfg.get('normalize_obs', True):
+            obs_rms = None
+            print("Observation normalisation: disabled.")
+        elif obs_rms is None:
+            print("Warning: checkpoint has no obs_rms — running without normalisation.")
+        else:
+            print("Observation normalisation: loaded from checkpoint.")
+
+        controller = MappoController(env, actor, params, obs_rms)
 
     # -- Pygame setup --
     mw    = env.map_layout.width
@@ -357,11 +497,13 @@ def main() -> None:
 
     pygame.init()
     surface = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption('MAPPO Coverage — Visual Test')
+    pygame.display.set_caption(f'{controller.label.strip()} Coverage — Visual Test')
     clock = pygame.time.Clock()
     font  = pygame.font.SysFont('monospace', 15)
 
-    view_state = {'show_lidar': False}
+    palette = _ownership_palette(env.num_robots)
+    # The overlay only has something to say once a partition exists.
+    view_state = {'show_lidar': False, 'show_owner': args.policy == 'bosco'}
     key = jax.random.PRNGKey(args.seed)
 
     ep_num = 0
@@ -369,8 +511,8 @@ def main() -> None:
         while args.episodes == 0 or ep_num < args.episodes:
             key, ep_key = jax.random.split(key)
             print(f"Episode {ep_num + 1} ...", end='', flush=True)
-            ret = run_episode(env, policy_step, params, obs_rms, ep_key,
-                              surface, clock, font, walls, args.fps, view_state)
+            ret = run_episode(env, controller, ep_key, surface, clock, font,
+                              walls, palette, args.fps, view_state)
             if ret is None:
                 print("  (quit)")
                 break

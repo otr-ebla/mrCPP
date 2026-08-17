@@ -92,3 +92,16 @@ train:
   huber_delta: 1.0
   n_epochs: 10           # PPO epochs per update
   normalize_obs: true    # RunningMeanStd normalisation for stable training
+
+# Weights & Biases dashboards. Every field can be overridden from the command
+# line (--wandb / --no-wandb / --wandb-project / --wandb-mode / ...). A failed
+# init is never fatal: training falls back to the console and the CSV log.
+wandb:
+  enabled: true
+  project: mrcpp-mappo
+  entity:                # null → your default W&B entity
+  name:                  # null → W&B generates a run name
+  group:                 # null → ungrouped; set to compare seeds of one config
+  # "online" needs `wandb login` once. Use "offline" to log to ./wandb and sync
+  # later with `wandb sync`, or "disabled" to keep the calls as no-ops.
+  mode: online

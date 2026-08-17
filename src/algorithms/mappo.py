@@ -111,6 +111,11 @@ class Transition(NamedTuple):
     term:     jax.Array   # float32 0/1, not bool — see module docstring
     done:     jax.Array   # float32 0/1, not bool — see module docstring
     coverage: jax.Array
+    # Diagnostics only; never read by the update. All (T, E) float32.
+    wall_hit:  jax.Array  # fraction of the team that hit a wall this step
+    robot_hit: jax.Array  # fraction of the team that hit another robot
+    complete:  jax.Array  # 1.0 when the map was fully covered on this step
+    timeout:   jax.Array  # 1.0 when the step hit the truncation horizon
 
 
 class RolloutCarry(NamedTuple):
@@ -339,6 +344,10 @@ class MAPPO:
                 term=term.astype(jnp.float32),
                 done=done.astype(jnp.float32),
                 coverage=info['coverage_ratio'],
+                wall_hit=info['wall_collision_rate'],
+                robot_hit=info['robot_collision_rate'],
+                complete=info['complete'],
+                timeout=info['timeout'],
             )
             return RolloutCarry(env_state, next_obs, next_gstate, rms), transition
 
