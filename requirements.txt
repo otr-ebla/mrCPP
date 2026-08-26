@@ -1,7 +1,34 @@
 torch>=2.0.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
 gymnasium>=0.28.1
 pyyaml>=6.0
 matplotlib>=3.7.0
 pygame>=2.5.0
 wandb>=0.16.0
+
+# Additional dependencies used by the project
+flax
+ruamel.yaml
+
+# Local packages
+-e ./dreamerv3
+
+# DreamerV3 dependencies
+ale_py==0.9.0
+autorom[accept-rom-license]==0.6.1
+av
+chex
+colored_traceback
+einops
+elements>=3.19.1
+google-resumable-media>=2.7.2
+granular>=0.20.3
+ipdb
+jax
+jaxlib
+jaxtyping
+ninjax>=3.5.1
+optax
+portal>=3.5.0
+scope>=0.4.4
+tqdm

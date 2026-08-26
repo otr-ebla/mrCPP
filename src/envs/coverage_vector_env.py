@@ -241,7 +241,8 @@ class MultiRobotCoverageEnv:
 
     def _cast_lidar_single(
         self, pos: jax.Array, heading: jax.Array,
-        all_pos: jax.Array, other_mask: jax.Array, map_id: jax.Array
+        all_pos: jax.Array, other_mask: jax.Array, map_id: jax.Array,
+        human_pos: jax.Array, human_hdg: jax.Array
     ) -> jax.Array:
         angles = heading + self._ray_angles
         dx = jnp.cos(angles)
@@ -273,15 +274,41 @@ class MultiRobotCoverageEnv:
         t_r  = jnp.where((disc >= 0) & (t_r > 1e-6) & other_mask[:, None], t_r, jnp.inf)
         t_min = jnp.minimum(t_min, jnp.min(t_r, axis=0))
 
+        if self.num_humans > 0:
+            a = self.robot_radius * 0.6  # Semi-axis along heading
+            b_ax = self.robot_radius * 1.2  # Semi-axis perpendicular to heading
+            a2 = a ** 2
+            b2 = b_ax ** 2
+            
+            h_cos = jnp.cos(human_hdg)
+            h_sin = jnp.sin(human_hdg)
+            
+            w_h = pos[None, :] - human_pos
+            ox = w_h[:, 0] * h_cos + w_h[:, 1] * h_sin
+            oy = -w_h[:, 0] * h_sin + w_h[:, 1] * h_cos
+            
+            dx_loc = dx[None, :] * h_cos[:, None] + dy[None, :] * h_sin[:, None]
+            dy_loc = -dx[None, :] * h_sin[:, None] + dy[None, :] * h_cos[:, None]
+            
+            A = (dx_loc**2) / a2 + (dy_loc**2) / b2
+            B = 2.0 * ((ox[:, None] * dx_loc) / a2 + (oy[:, None] * dy_loc) / b2)
+            C = jnp.expand_dims((ox**2) / a2 + (oy**2) / b2 - 1.0, axis=-1)
+            
+            disc_h = B**2 - 4.0 * A * C
+            t_h = (-B - jnp.sqrt(jnp.maximum(disc_h, 0.0))) / (2.0 * A)
+            t_h = jnp.where((disc_h >= 0) & (t_h > 1e-6), t_h, jnp.inf)
+            
+            t_min = jnp.minimum(t_min, jnp.min(t_h, axis=0))
+
         dist = jnp.clip(t_min, 0.0, self.max_lidar_range)
         return dist / self.max_lidar_range
 
-    def _cast_lidar_all(self, positions: jax.Array, headings: jax.Array, map_id: jax.Array) -> jax.Array:
+    def _cast_lidar_all(self, state: EnvState) -> jax.Array:
         n = self.num_robots
         not_self = ~jnp.eye(n, dtype=bool)
         return jax.vmap(
-            self._cast_lidar_single, in_axes=(0, 0, None, 0, None)
-        )(positions, headings, positions, not_self, map_id)
+            self._cast_lidar_single, in_axes=(0, 0, None, 0, None, None, None)
+        )(state.robot_positions, state.robot_headings, state.robot_positions, not_self, state.map_id, state.human_positions, state.human_headings)
 
     def _sample_spawns(self, key: jax.Array, map_id: jax.Array, num_spawns: int) -> jax.Array:
         cands = self._spawn_candidates[map_id]
@@ -498,7 +525,7 @@ class MultiRobotCoverageEnv:
         if pad_k > 0:
             parts.append(jnp.zeros((n, pad_k * 2), jnp.float32))
 
-        parts.append(self._cast_lidar_all(state.robot_positions, state.robot_headings, state.map_id))
+        parts.append(self._cast_lidar_all(state))
 
         return jnp.concatenate(parts, axis=1).astype(jnp.float32)
 

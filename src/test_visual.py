@@ -125,7 +125,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         info['coverage_ratio'],
         info['covered_cells'],
         info['total_cells'],
-        env._cast_lidar_all(state.robot_positions, state.robot_headings, state.map_id)
+        env._cast_lidar_all(state)
         if want_lidar else jnp.zeros((0,), jnp.float32),
     )
     pos, hdg, human_pos, human_hdg, grid, alive, step, cov_ratio, covered, total, lidar = jax.device_get(payload)
