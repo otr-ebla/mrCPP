@@ -15,6 +15,7 @@ Usage (from the project root):
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import pickle
 import sys
@@ -116,19 +117,23 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
     payload = (
         state.robot_positions,
         state.robot_headings,
+        state.human_positions if env.num_humans > 0 else jnp.zeros((0, 2), jnp.float32),
+        state.human_headings if env.num_humans > 0 else jnp.zeros((0,), jnp.float32),
         state.coverage_grid,
         state.robot_alive,
         info['step'],
         info['coverage_ratio'],
         info['covered_cells'],
         info['total_cells'],
-        env._cast_lidar_all(state.robot_positions, state.robot_headings)
+        env._cast_lidar_all(state.robot_positions, state.robot_headings, state.map_id)
         if want_lidar else jnp.zeros((0,), jnp.float32),
     )
-    pos, hdg, grid, alive, step, cov_ratio, covered, total, lidar = jax.device_get(payload)
+    pos, hdg, human_pos, human_hdg, grid, alive, step, cov_ratio, covered, total, lidar = jax.device_get(payload)
     return {
         'positions':      np.asarray(pos),
         'headings':       np.asarray(hdg),
+        'human_positions': np.asarray(human_pos),
+        'human_headings': np.asarray(human_hdg),
         'coverage_grid':  np.asarray(grid),
         'alive':          np.asarray(alive),
         'step':           int(step),
@@ -235,6 +240,24 @@ def _draw_frame(
         # robot index label
         lbl = font.render(str(i), True, (255, 255, 255))
         surface.blit(lbl, (cx - lbl.get_width() // 2, cy - lbl.get_height() // 2))
+
+    # -- Humans --
+    human_positions = snap['human_positions']
+    human_headings = snap['human_headings']
+    
+    if human_positions.shape[0] > 0:
+        ry, rx = int(r_px * 1.2), max(2, int(r_px * 0.6))
+        h_surf = pygame.Surface((2 * ry, 2 * ry), pygame.SRCALPHA)
+        pygame.draw.ellipse(h_surf, (170, 170, 170), (ry - rx, 0, 2 * rx, 2 * ry))
+        dot_r = max(2, int(rx / 2))
+        pygame.draw.circle(h_surf, (0, 0, 0), (ry + rx - dot_r, ry), dot_r)
+
+        for i in range(human_positions.shape[0]):
+            cx, cy = _to_px(human_positions[i, 0], human_positions[i, 1], mh)
+            hdg = human_headings[i]
+            rot_surf = pygame.transform.rotate(h_surf, math.degrees(hdg))
+            rect = rot_surf.get_rect(center=(cx, cy))
+            surface.blit(rot_surf, rect)
 
     # -- HUD --
     win_h = surface.get_height()
@@ -462,10 +485,13 @@ def main() -> None:
                         choices=['auto', 'metal', 'cuda', 'gpu', 'cpu'],
                         help='JAX backend. Default "cpu": a single-env rollout is '
                              'tiny, so the CPU beats accelerator launch overhead')
+    parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     args = parser.parse_args()
 
     config    = load_config(args.config)
     env_cfg   = config.get('env',   {})
+    if args.humans > 0:
+        env_cfg['num_humans'] = args.humans
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
 

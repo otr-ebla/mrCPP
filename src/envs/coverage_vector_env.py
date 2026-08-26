@@ -28,6 +28,8 @@ class EnvState:
     robot_headings:   jax.Array   # (N,)     float32
     robot_velocities: jax.Array   # (N, 2)   float32  — [v, omega] commanded
     human_positions:  jax.Array   # (M, 2)   float32
+    human_headings:   jax.Array   # (M,)     float32
+    human_dists:      jax.Array   # (M,)     float32
     bosco_targets:    jax.Array   # (N, 2)   float32  — target coordinates for BOSCO
     coverage_grid:    jax.Array   # (H, W)   float32  — 0.0 / 1.0
     room_completed:   jax.Array   # (R,)     bool
@@ -281,42 +283,52 @@ class MultiRobotCoverageEnv:
             self._cast_lidar_single, in_axes=(0, 0, None, 0, None)
         )(positions, headings, positions, not_self, map_id)
 
-    def _sample_spawns(self, key: jax.Array, map_id: jax.Array) -> jax.Array:
+    def _sample_spawns(self, key: jax.Array, map_id: jax.Array, num_spawns: int) -> jax.Array:
         cands = self._spawn_candidates[map_id]
         if not self._spawn_needs_greedy:
-            idx = jax.random.permutation(key, self._num_candidates)[: self.num_robots]
+            idx = jax.random.permutation(key, self._num_candidates)[: num_spawns]
             return cands[idx]
 
         shuffled = jax.random.permutation(key, cands, axis=0)
-        slots = jnp.arange(self.num_robots)
+        slots = jnp.arange(num_spawns)
 
         def body(carry, cand):
             chosen, count = carry
             d = jnp.sqrt(jnp.sum((chosen - cand[None, :]) ** 2, axis=1))
             active = slots < count
             clear = jnp.all(jnp.where(active, d >= self._spawn_clearance, True))
-            take = clear & (count < self.num_robots)
+            take = clear & (count < num_spawns)
             write = take & (slots == count)
             chosen = jnp.where(write[:, None], cand[None, :], chosen)
             return (chosen, count + take.astype(count.dtype)), None
 
-        init = (jnp.zeros((self.num_robots, 2), jnp.float32), jnp.int32(0))
+        init = (jnp.zeros((num_spawns, 2), jnp.float32), jnp.int32(0))
         (chosen, _), _ = jax.lax.scan(body, init, shuffled)
         return chosen
 
     def reset(self, key: jax.Array) -> EnvState:
-        key, map_key, spawn_key, hdg_key = jax.random.split(key, 4)
+        key, map_key, spawn_key, r_hdg_key, h_hdg_key, h_dist_key = jax.random.split(key, 6)
         map_id = jax.random.randint(map_key, (), 0, self.num_maps)
         
-        robot_positions = self._sample_spawns(spawn_key, map_id)
+        total_spawns = self.num_robots + self.num_humans
+        spawns = self._sample_spawns(spawn_key, map_id, total_spawns)
+        
+        robot_positions = spawns[:self.num_robots]
+        human_positions = spawns[self.num_robots:]
         
         return EnvState(
             robot_positions  = robot_positions,
             robot_headings   = jax.random.uniform(
-                hdg_key, (self.num_robots,), minval=0.0, maxval=_TWO_PI
+                r_hdg_key, (self.num_robots,), minval=0.0, maxval=_TWO_PI
             ),
             robot_velocities = jnp.zeros((self.num_robots, 2), jnp.float32),
-            human_positions  = jnp.zeros((self.num_humans, 2), jnp.float32),
+            human_positions  = human_positions,
+            human_headings   = jax.random.uniform(
+                h_hdg_key, (self.num_humans,), minval=0.0, maxval=_TWO_PI
+            ),
+            human_dists      = jax.random.uniform(
+                h_dist_key, (self.num_humans,), minval=0.5, maxval=5.0
+            ),
             bosco_targets    = robot_positions,  # initialize target to current pos
             coverage_grid    = jnp.zeros((self.grid_h, self.grid_w), jnp.float32),
             room_completed   = jnp.zeros((self.num_rooms,), bool),
@@ -350,7 +362,36 @@ class MultiRobotCoverageEnv:
         close    = (d2 < (2.0 * self.robot_radius) ** 2) & pair_ok
         robot_hit = jnp.any(close, axis=1) & alive
 
-        collided = (wall_hit | robot_hit) & alive
+        key, h_hdg_key, h_dist_key = jax.random.split(state.key, 3)
+        if self.num_humans > 0:
+            h_v = 0.5
+            dist_step = h_v * self.dt
+            h_dx = dist_step * jnp.cos(state.human_headings)
+            h_dy = dist_step * jnp.sin(state.human_headings)
+            h_cand_pos = state.human_positions + jnp.stack([h_dx, h_dy], axis=-1)
+            h_wall_hit = self._wall_collision(h_cand_pos, state.map_id)
+            
+            new_h_dists = state.human_dists - dist_step
+            need_new = h_wall_hit | (new_h_dists <= 0)
+            
+            new_headings = jax.random.uniform(h_hdg_key, (self.num_humans,), minval=0.0, maxval=_TWO_PI)
+            new_dists = jax.random.uniform(h_dist_key, (self.num_humans,), minval=0.5, maxval=5.0)
+            
+            final_h_headings = jnp.where(need_new, new_headings, state.human_headings)
+            final_h_dists = jnp.where(need_new, new_dists, new_h_dists)
+            
+            new_human_pos = jnp.where(h_wall_hit[:, None], state.human_positions, h_cand_pos)
+
+            diff_rh = next_pos[:, None, :] - new_human_pos[None, :, :]
+            d2_rh = jnp.sum(diff_rh * diff_rh, axis=-1)
+            robot_hit_human = jnp.any(d2_rh < (2.0 * self.robot_radius) ** 2, axis=1) & alive
+        else:
+            new_human_pos = state.human_positions
+            final_h_headings = state.human_headings
+            final_h_dists = state.human_dists
+            robot_hit_human = jnp.zeros((self.num_robots,), dtype=bool)
+
+        collided = (wall_hit | robot_hit | robot_hit_human) & alive
         alive_next = alive & ~collided if self.terminate_on_collision else alive
 
         moved   = alive & ~collided
@@ -407,17 +448,21 @@ class MultiRobotCoverageEnv:
 
         step_count = state.step_count + 1
         truncated  = step_count >= self.max_steps
-        terminated = complete | (jnp.any(collided) if self.terminate_on_collision
+        terminated = complete | jnp.any(robot_hit_human) | (jnp.any(collided) if self.terminate_on_collision
                                  else jnp.bool_(False))
 
         next_state = state.replace(
             robot_positions  = new_pos,
             robot_headings   = new_hdg,
             robot_velocities = new_vel,
+            human_positions  = new_human_pos,
+            human_headings   = final_h_headings,
+            human_dists      = final_h_dists,
             coverage_grid    = new_grid,
             room_completed   = room_completed,
             robot_alive      = alive_next,
             step_count       = step_count,
+            key              = key,
             wall_hits        = wall_hit.astype(jnp.float32),
             robot_hits       = robot_hit.astype(jnp.float32),
         )

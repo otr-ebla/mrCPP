@@ -151,6 +151,21 @@ def draw_robots(screen: pygame.Surface, env: MultiRobotCoverageEnv) -> None:
         lbl = font_small.render(str(i), True, (255, 255, 255))
         screen.blit(lbl, (sx - lbl.get_width() // 2, sy - lbl.get_height() // 2))
 
+    if env.human_positions.shape[0] > 0:
+        ry, rx = int(r_px * 1.2), max(2, int(r_px * 0.6))
+        h_surf = pygame.Surface((2 * ry, 2 * ry), pygame.SRCALPHA)
+        pygame.draw.ellipse(h_surf, (170, 170, 170), (ry - rx, 0, 2 * rx, 2 * ry))
+        dot_r = max(2, int(rx / 2))
+        pygame.draw.circle(h_surf, (0, 0, 0), (ry + rx - dot_r, ry), dot_r)
+
+        for i in range(env.human_positions.shape[0]):
+            pos = env.human_positions[i]
+            sx, sy = w2s(pos[0], pos[1])
+            hdg = env.human_headings[i]
+            rot_surf = pygame.transform.rotate(h_surf, math.degrees(hdg))
+            rect = rot_surf.get_rect(center=(sx, sy))
+            screen.blit(rot_surf, rect)
+
 
 # ---------------------------------------------------------------------------
 # HUD
@@ -178,7 +193,13 @@ def draw_hud(screen: pygame.Surface, font: pygame.font.Font,
 # Main
 # ---------------------------------------------------------------------------
 
+import argparse
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
+    args = parser.parse_args()
+
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     pygame.display.set_caption("Multi-Robot Coverage — random policy + LiDAR")
@@ -189,7 +210,7 @@ def main() -> None:
     cover_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
     lidar_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
 
-    env = MultiRobotCoverageEnv()
+    env = MultiRobotCoverageEnv({'num_humans': args.humans})
     env.reset()
 
     step  = 0

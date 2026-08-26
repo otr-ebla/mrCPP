@@ -342,6 +342,8 @@ def pretrain(args) -> None:
     env_cfg = dict(config.get('env', {}))
     if args.max_steps is not None:
         env_cfg['max_steps'] = args.max_steps
+    if args.humans > 0:
+        env_cfg['num_humans'] = args.humans
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
 
@@ -544,6 +546,7 @@ def main() -> None:
                     help='also write the collected dataset to this .npz')
     ap.add_argument('--backend', default='auto',
                     choices=['auto', 'metal', 'cuda', 'gpu', 'cpu'])
+    ap.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     pretrain(ap.parse_args())
 
 

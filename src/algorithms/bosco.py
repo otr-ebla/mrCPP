@@ -1405,6 +1405,7 @@ def main() -> None:
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--save', type=str, default=None,
                     help='write the behaviour-cloning dataset to this .npz')
+    ap.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     args = ap.parse_args()
 
     import jax
@@ -1415,6 +1416,7 @@ def main() -> None:
         'num_robots': args.robots,
         'max_steps': args.max_steps,
         'terminate_on_collision': False,
+        'num_humans': args.humans,
     })
     expert = BoscoExpert(env)
 

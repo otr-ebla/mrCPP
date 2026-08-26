@@ -310,14 +310,14 @@ class _WidenedEnv:
 
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 2.0,
-          wandb_overrides: dict | None = None):
+          wandb_overrides: dict | None = None, num_humans: int = 0):
     config = load_config(config_path)
-    # Must run before any array is created so implicit placement follows the
-    # selected backend: Metal on Apple Silicon, else CUDA, else CPU.
     device = select_device(backend)
     print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
 
     env_cfg   = config.get('env',   {})
+    if num_humans > 0:
+        env_cfg['num_humans'] = num_humans
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
 
@@ -642,6 +642,7 @@ if __name__ == '__main__':
     parser.add_argument('--wandb-mode',    default=None,
                         choices=['online', 'offline', 'disabled'],
                         help='W&B mode; "offline" logs locally with no network')
+    parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -653,4 +654,4 @@ if __name__ == '__main__':
               'name':    args.wandb_name,
               'group':   args.wandb_group,
               'mode':    args.wandb_mode,
-          })
+          }, num_humans=args.humans)
