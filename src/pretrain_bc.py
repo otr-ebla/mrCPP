@@ -320,10 +320,11 @@ def collect(vec_env, experts, state, obs, buffers, rng, steps, noise_std, stats)
         if done_np.any():
             coverage = np.asarray(info['coverage_ratio'])
             fresh_pos = np.asarray(state.robot_positions)   # already the new episode
+            fresh_map = np.asarray(state.map_id)
             for e in np.flatnonzero(done_np):
                 stats['episodes'] += 1
                 stats['coverage'].append(float(coverage[e]))
-                experts[e].reset(fresh_pos[e])
+                experts[e].reset(fresh_pos[e], map_id=int(fresh_map[e]))
 
     return state, obs
 
@@ -392,8 +393,10 @@ def pretrain(args) -> None:
 
     experts = make_experts(env, E)
     state, obs, _, _ = vec_env.reset(reset_key)
+    map_ids = np.asarray(state.map_id)
     for e in range(E):
-        experts[e].reset(np.asarray(state.robot_positions[e]))
+        experts[e].reset(np.asarray(state.robot_positions[e]),
+                         map_id=int(map_ids[e]))
 
     train_buf = Buffer(vec_env.obs_dim, vec_env.action_dim)
     val_buf = Buffer(vec_env.obs_dim, vec_env.action_dim)

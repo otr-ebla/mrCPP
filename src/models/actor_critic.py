@@ -62,7 +62,7 @@ class Actor(nn.Module):
     Shared-parameter feed-forward actor used by all N robots.
 
     The observation layout is fixed by the environment:
-        [continuous vector (vec_dim) | lidar (n_rays) | binary patch (patch_dim)]
+        [continuous vector (vec_dim) | lidar (n_rays)]
 
     Actions are sampled from a tanh-squashed Normal distribution:
         z ~ N(mean, exp(log_std)),  a = tanh(z)  in (-1, 1)^action_dim
@@ -71,7 +71,6 @@ class Actor(nn.Module):
     action_dim: int = 2
     vec_dim: int = 8
     n_rays: int = 36
-    patch_dim: int = 25
     lidar_embed: int = 64
     hidden_size: int = 128
 
@@ -84,7 +83,6 @@ class Actor(nn.Module):
         """
         vec   = obs[:, : self.vec_dim]
         lidar = obs[:, self.vec_dim : self.vec_dim + self.n_rays]
-        patch = obs[:, self.vec_dim + self.n_rays :]
 
         # A lidar scan is a ring, so circular padding keeps the two ends of the
         # array adjacent and makes the features rotation-equivariant.
@@ -93,7 +91,7 @@ class Actor(nn.Module):
         x = nn.relu(_conv(32, (3,), (2,), 'CIRCULAR')(x))
         x = nn.relu(_dense(self.lidar_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
 
-        h = jnp.concatenate([x, vec, patch], axis=-1)
+        h = jnp.concatenate([x, vec], axis=-1)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
 

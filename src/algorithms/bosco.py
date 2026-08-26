@@ -37,21 +37,29 @@ Pipeline
    normalised action:
        action[0] -> v     in [0, v_max]      (a0 = 2v/v_max - 1)
        action[1] -> omega in [-omega_max, omega_max]
-   Three reactive layers keep the open-loop tour honest:
+   Four reactive layers keep the open-loop tour honest:
      * line-of-sight shortcutting — aim at the farthest tour node still reachable
        in a straight, wall-free line *whose segment still crosses every skipped
        cell*, so smoothing never sacrifices coverage;
      * priority yielding — on a near encounter the higher-id robot stops, which
        removes the collision penalty without any negotiation protocol;
-     * stuck recovery + mop-up — a robot that stops making progress spins and
-       replans; a robot whose tour is finished walks to the nearest cell still
-       uncovered (own region first, then the whole map), so the team converges to
-       full coverage instead of idling.
+     * stuck recovery + mop-up — a robot that stops making progress pulls clear of
+       any teammate it is wedged against, replans, and spins if it keeps failing;
+       a robot whose tour is finished walks to the nearest cell still uncovered
+       (own region first, then the whole map), so the team converges to full
+       coverage instead of idling;
+     * an idle watchdog on the pose alone. The layers above act on the robot's
+       *plan*, so none of them can see a robot the planner itself has told to
+       stand still, and that is the failure mode that ends a sweep: any robot
+       which has not left an `arrive_tol` ball in `idle_limit` steps is pushed
+       through recovery whatever its plan believes it is doing.
 
 Measured on the default 12x8 m indoor map (384 coverable cells, 3 robots):
-100% coverage on every episode, ~2100 steps to finish, ~17 soft collisions per
-episode. The step count is dominated by turning: at omega_max = 1 rad/s a 90°
-lane change costs 16 steps.
+100% coverage on every episode, ~1600 steps to finish, ~16 soft collisions per
+episode, and no robot ever stationary for more than the ~25 steps a deliberate
+yield costs. The step count is dominated by turning: at omega_max = 1 rad/s a 90°
+lane change costs 16 steps, and roughly half of all steps are spent turning in
+place.
 
 Usage
 -----
@@ -104,13 +112,15 @@ class TraversabilityGraph:
     # 4-neighbourhood as (drow, dcol)
     _DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
-    def __init__(self, env, edge_samples: int = 11, los_step: float = 0.05):
+    def __init__(self, env, edge_samples: int = 11, los_step: float = 0.05,
+                 map_id: int = 0):
         self.h, self.w = env.grid_h, env.grid_w
         self.cell_size = env.cell_size
         self.n_cells = self.h * self.w
+        self.map_id = int(map_id)
         self.los_step = float(los_step)
 
-        walls = np.asarray(env.map_layout.get_walls(), dtype=np.float32)
+        walls = np.asarray(env.walls[self.map_id], dtype=np.float32)
         self._wx0, self._wy0 = walls[None, :, 0], walls[None, :, 1]
         self._wx1, self._wy1 = walls[None, :, 2], walls[None, :, 3]
         # Exactly the environment's own collision radius. Inflating it would
@@ -125,7 +135,12 @@ class TraversabilityGraph:
             (rows + 0.5) * self.cell_size,
         ], axis=1).astype(np.float32)
         self.rows, self.cols = rows, cols
-        self.free = np.asarray(env.free_mask_np, dtype=np.float32).ravel() > 0.5
+        self.free = np.asarray(env.free_mask_np[self.map_id], dtype=np.float32).ravel() > 0.5
+
+        room_masks = np.asarray(env.room_masks[self.map_id]) > 0.5
+        self.room_id = np.full(self.n_cells, -1, dtype=np.int32)
+        for ri in range(len(room_masks)):
+            self.room_id[room_masks[ri].ravel()] = ri
 
         self.neighbors, self.degree = self._build_edges(edge_samples)
         self.component = self._connected_components()
@@ -289,40 +304,305 @@ class TraversabilityGraph:
 # Phase 1 & 2 — ownership and boustrophedon tours
 # ---------------------------------------------------------------------------
 
-def partition_cells(graph: TraversabilityGraph, starts: np.ndarray) -> np.ndarray:
-    """Balanced multi-source wavefront. Returns (C,) owner id, -1 if unowned.
+def _repair_connectivity(graph: TraversabilityGraph, owner: np.ndarray,
+                         starts: np.ndarray, dist: np.ndarray,
+                         n_robots: int) -> np.ndarray:
+    """Re-assign stray (disconnected) components to adjacent robot regions.
 
-    The robot with the smallest region always expands next, so the areas stay
-    balanced without any post-hoc rebalancing pass, and every region is
-    connected because a cell is only ever claimed from an owned neighbour.
+    Voronoi partitions can produce disconnected pockets in corridor-heavy maps:
+    a robot may "win" a cluster of cells separated from its spawn by another
+    robot's territory.  BFS from each spawn within its own region identifies
+    those strays; each stray cell is then re-assigned to the adjacent robot with
+    the shortest BFS distance to it, so total travel time barely changes.
+    The outer loop repeats until no strays remain (cascade-safe).
+    """
+    owner = owner.copy()
+    changed = True
+    while changed:
+        changed = False
+        for r in range(n_robots):
+            s = int(starts[r])
+            mask = owner == r
+            if not mask[s]:
+                continue            # spawn was re-assigned — skip safely
+            # BFS within r's territory from its spawn cell
+            visited = np.zeros(graph.n_cells, dtype=bool)
+            queue = deque([s])
+            visited[s] = True
+            while queue:
+                c = queue.popleft()
+                for nb in graph.neighbors[c]:
+                    nb = int(nb)
+                    if nb >= 0 and mask[nb] and not visited[nb]:
+                        visited[nb] = True
+                        queue.append(nb)
+            # Cells owned by r but unreachable from its spawn are strays
+            for c in np.flatnonzero(mask & ~visited):
+                best_r, best_d = -1, np.inf
+                # Prefer a graph-adjacent neighbour already in another region
+                for nb in graph.neighbors[c]:
+                    nb = int(nb)
+                    if nb >= 0 and owner[nb] != r:
+                        nr = int(owner[nb])
+                        if nr >= 0 and dist[nr, c] < best_d:
+                            best_d, best_r = dist[nr, c], nr
+                if best_r < 0:      # no adjacent neighbour — fall back to global min
+                    for r2 in range(n_robots):
+                        if r2 != r and dist[r2, c] < best_d:
+                            best_d, best_r = dist[r2, c], r2
+                if best_r >= 0:
+                    owner[c] = best_r
+                    changed = True
+    return owner
+
+
+def _is_connected_after_removal(graph: TraversabilityGraph, owner: np.ndarray,
+                                 r: int, cell: int, spawn: int) -> bool:
+    """True if robot r's region minus `cell` is still connected from `spawn`."""
+    mask = (owner == r)
+    mask[cell] = False
+    if not mask[spawn]:
+        return False                # removing the spawn itself — never allowed
+    visited = np.zeros(graph.n_cells, dtype=bool)
+    queue = deque([spawn])
+    visited[spawn] = True
+    while queue:
+        c = queue.popleft()
+        for nb in graph.neighbors[c]:
+            nb = int(nb)
+            if nb >= 0 and mask[nb] and not visited[nb]:
+                visited[nb] = True
+                queue.append(nb)
+    return bool(np.all(visited[mask]))
+
+
+def _balance_by_swap(graph: TraversabilityGraph, owner: np.ndarray,
+                     starts: np.ndarray, dist: np.ndarray,
+                     target: np.ndarray, n_robots: int,
+                     n_cells: int) -> np.ndarray:
+    """Greedily transfer boundary cells to balance region sizes.
+
+    Evaluates all borders between regions and diffuses cells from larger
+    regions to smaller ones. This allows cells to flow across intermediate
+    robots, fixing cases where a robot is "boxed in" by the wavefront.
+    Runs until every robot's count is within 1 of its target or no swap
+    is possible.
+    """
+    owner = owner.copy()
+    counts = np.array([(owner == r).sum() for r in range(n_robots)],
+                      dtype=np.float64)
+
+    for _outer in range(n_cells * 5):
+        if np.max(np.abs(counts - target)) <= 1:
+            break
+            
+        # Find all valid boundary swaps
+        # A valid swap is a cell `c` owned by `donor` adjacent to a cell
+        # owned by `recv`, where counts[donor] > counts[recv] + 1.
+        candidates = []
+        for c in range(n_cells):
+            donor = int(owner[c])
+            if donor < 0:
+                continue
+            for nb in graph.neighbors[c]:
+                nb = int(nb)
+                if nb < 0:
+                    continue
+                recv = int(owner[nb])
+                if recv < 0 or recv == donor:
+                    continue
+                
+                count_diff = counts[donor] - counts[recv]
+                if count_diff > 1.1:  # strictly greater than 1 (allowing for float inaccuracies)
+                    # We want to maximize count_diff, and minimize distance
+                    # We store (-count_diff, dist) to use min-heap / sort
+                    cost = float(dist[recv, c])
+                    candidates.append((-count_diff, cost, c, donor, recv))
+                    
+        if not candidates:
+            break  # No border cells can be swapped to improve balance
+            
+        # Sort candidates: primarily by largest count difference (most balancing),
+        # secondarily by smallest distance (keeps regions compact).
+        candidates.sort()
+        
+        swapped = False
+        for _, _, c, donor, recv in candidates:
+            if _is_connected_after_removal(graph, owner, donor, c, int(starts[donor])):
+                owner[c] = recv
+                counts[donor] -= 1
+                counts[recv] += 1
+                swapped = True
+                break
+                
+        if not swapped:
+            break  # All balancing swaps break connectivity
+
+    return owner
+
+
+def partition_cells(graph: TraversabilityGraph, starts: np.ndarray,
+                    max_iter: int = 100, alpha: float = 0.5) -> np.ndarray:
+    """Balanced, makespan-aware cell partition.  Returns (C,) owner id (int32).
+
+    Cells unreachable by any robot are left at -1, matching the old interface.
+
+    Algorithm
+    ---------
+    One BFS per robot computes the hop-count distance from each spawn to every
+    free cell.  A single unified priority-queue wavefront then assigns cells
+    using a two-level priority key:
+
+        key = (count[r] / target[r],  dist[r, c])
+
+    Primary key — fractional fill: the robot furthest below its fair share
+    always claims the next cell.  This guarantees that final region sizes
+    satisfy |count[r] - target[r]| ≤ 1 for every robot by construction, with
+    no post-hoc rebalancing pass.
+
+    Secondary key — BFS distance: when two robots have the same fill ratio
+    (common at the start and at integer multiples of the target), the one
+    closest to the frontier cell wins.  Closeness = shorter travel time, so
+    this secondary sort directly minimises the makespan — the time the last
+    robot needs to finish — without sacrificing the fairness guarantee.
+
+    Regions are connected by construction (a robot only ever claims a cell
+    adjacent to one it already owns), so `_repair_connectivity` is not needed
+    in normal operation but is kept as a safety net.
+
+    The old helper functions (`_balance_by_swap`, `_repair_connectivity`) are
+    retained and still callable; this function no longer invokes either.
     """
     n_robots = len(starts)
-    owner = np.full(graph.n_cells, -1, dtype=np.int32)
-    frontier = [deque() for _ in range(n_robots)]
-    counts = np.zeros(n_robots, dtype=np.int64)
+    n_cells = graph.n_cells
+
+    # ------------------------------------------------------------------ #
+    # Step 1: BFS hop-count distances from each spawn                     #
+    # ------------------------------------------------------------------ #
+    INF = np.float32(np.inf)
+    dist = np.full((n_robots, n_cells), INF, dtype=np.float32)
+    for r, s in enumerate(starts):
+        s = int(s)
+        dist[r, s] = 0.0
+        queue = deque([s])
+        while queue:
+            c = queue.popleft()
+            nd = dist[r, c] + 1.0
+            for nb in graph.neighbors[c]:
+                nb = int(nb)
+                if nb >= 0 and dist[r, nb] == INF:
+                    dist[r, nb] = nd
+                    queue.append(nb)
+
+    free_count = int(graph.free.sum())
+    if n_robots == 0 or free_count == 0:
+        return np.full(n_cells, -1, dtype=np.int32)
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Target counts                                               #
+    # ------------------------------------------------------------------ #
+    fair = free_count // n_robots
+    remainder = free_count % n_robots
+    # First `remainder` robots get one extra cell so the total is exact.
+    target = np.array([fair + (1 if r < remainder else 0)
+                       for r in range(n_robots)], dtype=np.float64)
+
+    # ------------------------------------------------------------------ #
+    # Step 3: Unified priority-queue wavefront                            #
+    #                                                                     #
+    # A robot-level min-heap drives expansion.  Each entry is:           #
+    #   (fill_ratio, min_frontier_dist, robot_id)                        #
+    # so the most under-loaded robot always expands next (fairness), and  #
+    # among equal-fill robots the one with the cheapest frontier cell     #
+    # expands (makespan: closest robot to unclaimed territory wins).      #
+    #                                                                     #
+    # Each expansion pops the cheapest reachable unowned cell from that   #
+    # robot's BFS frontier, claims it, and pushes the robot back with     #
+    # its updated fill ratio and new minimum frontier distance.           #
+    # Regions are connected by construction.                              #
+    # ------------------------------------------------------------------ #
+    owner = np.full(n_cells, -1, dtype=np.int32)
+    counts = np.zeros(n_robots, dtype=np.float64)
+    # Per-robot BFS frontier: min-heap of (bfs_dist, cell)
+    frontiers: list[list] = [[] for _ in range(n_robots)]
 
     for r, s in enumerate(starts):
         s = int(s)
-        if owner[s] >= 0:              # two robots in one cell: cannot happen
-            continue                   # with the env's lattice spawns
+        if owner[s] >= 0:
+            continue
         owner[s] = r
-        counts[r] = 1
-        frontier[r].extend(int(nb) for nb in graph.neighbors[s] if nb >= 0)
+        counts[r] = 1.0
+        for nb in graph.neighbors[s]:
+            nb = int(nb)
+            if nb >= 0 and graph.free[nb]:
+                heapq.heappush(frontiers[r], (float(dist[r, nb]), nb))
 
-    heap = [(int(counts[r]), r) for r in range(n_robots) if frontier[r]]
-    heapq.heapify(heap)
-    while heap:
-        _, r = heapq.heappop(heap)
-        dq = frontier[r]
-        while dq:
-            c = dq.popleft()
-            if owner[c] >= 0:
-                continue
-            owner[c] = r
-            counts[r] += 1
-            dq.extend(int(nb) for nb in graph.neighbors[c] if nb >= 0 and owner[nb] < 0)
-            heapq.heappush(heap, (int(counts[r]), r))
-            break
+    # Robot-level heap: (count, robot_id) — count drives fairness (smallest
+    # count always expands next), robot_id gives a stable deterministic tiebreak.
+    # Makespan awareness comes from each robot's per-frontier heap, which
+    # always expands the nearest unclaimed cell first.
+    robot_heap = []
+    for r in range(n_robots):
+        if frontiers[r]:
+            heapq.heappush(robot_heap, (int(counts[r]), r))
+
+    while robot_heap:
+        count, r = heapq.heappop(robot_heap)
+        # Drain stale frontier entries (already claimed by another robot)
+        while frontiers[r] and owner[frontiers[r][0][1]] >= 0:
+            heapq.heappop(frontiers[r])
+        if not frontiers[r]:
+            continue                # this robot's frontier is exhausted
+
+        # Claim the cheapest available frontier cell
+        d, c = heapq.heappop(frontiers[r])
+        while owner[c] >= 0:       # stale: keep draining
+            if not frontiers[r]:
+                break
+            d, c = heapq.heappop(frontiers[r])
+        if owner[c] >= 0:
+            continue
+
+        owner[c] = r
+        counts[r] += 1.0
+        for nb in graph.neighbors[c]:
+            nb = int(nb)
+            if nb >= 0 and graph.free[nb] and owner[nb] < 0:
+                heapq.heappush(frontiers[r], (float(dist[r, nb]), nb))
+
+        # Drain stale, then re-push robot if frontier not empty
+        while frontiers[r] and owner[frontiers[r][0][1]] >= 0:
+            heapq.heappop(frontiers[r])
+        if frontiers[r]:
+            heapq.heappush(robot_heap, (int(counts[r]), r))
+
+    # Any free cell still unowned sits in a traversability component that
+    # no robot spawned in.  Assign each to the most under-loaded robot whose
+    # current territory is adjacent to the cell; if none is, leave it at -1
+    # (it is genuinely isolated — no robot can reach it via the graph).
+    for c in np.flatnonzero((owner < 0) & graph.free):
+        best_r, best_fill = -1, np.inf
+        for nb in graph.neighbors[c]:
+            nb = int(nb)
+            if nb >= 0 and owner[nb] >= 0:
+                r2 = int(owner[nb])
+                f = counts[r2] / target[r2]
+                if f < best_fill:
+                    best_fill, best_r = f, r2
+        if best_r >= 0:
+            owner[c] = best_r
+            counts[best_r] += 1.0
+
+    # ------------------------------------------------------------------ #
+    # Step 4: Diffusion balancing                                         #
+    #                                                                     #
+    # The wavefront can "box in" a robot before it reaches its quota.     #
+    # _balance_by_swap iteratively transfers cells across borders from    #
+    # over-loaded to under-loaded regions, subject to connectivity,       #
+    # fixing any geometric trapping.                                      #
+    # ------------------------------------------------------------------ #
+    owner = _balance_by_swap(graph, owner, starts, dist, target, n_robots, n_cells)
+
     return owner
 
 
@@ -461,6 +741,61 @@ def plan_tour(graph: TraversabilityGraph, region: np.ndarray, start: int,
     return best_tour
 
 
+def plan_tour_room_aware(graph: TraversabilityGraph, region: np.ndarray, start: int,
+                         penalty: float = REVISIT_PENALTY) -> list[int]:
+    """Come plan_tour, ma esaurisce ogni stanza prima di passare alla successiva.
+
+    Ordine stanze: quella di partenza per prima (se dentro region), poi le
+    restanti in ordine "più vicina prossima" secondo il costo pesato dal punto
+    in cui il tour si trova in quel momento — così ogni transito tra stanze è
+    comunque il più economico disponibile, ma non può più "rubare" celle di
+    un'altra stanza mentre quella corrente non è finita.
+    """
+    start = int(start)
+    room = graph.room_id
+    rooms_here = sorted({int(room[c]) for c in np.flatnonzero(region) if room[c] >= 0})
+    if not rooms_here:
+        return plan_tour(graph, region, start, penalty)   # fallback: nessuna info stanza
+
+    def _best_axis_sweep(sub_region: np.ndarray, entry: int) -> list[int]:
+        best_key, best_tour = None, None
+        for dir_idx in (2, 0):
+            tour, transits = _sweep_tour(graph, sub_region, entry, dir_idx, penalty)
+            key = (len(tour) - len(set(tour)), transits)
+            if best_key is None or key < best_key:
+                best_key, best_tour = key, tour
+        return best_tour
+
+    tour = [start]
+    remaining = set(rooms_here)
+    cur_room = int(room[start]) if room[start] >= 0 else None
+    if cur_room in remaining:
+        tour += _best_axis_sweep(region & (room == cur_room), start)[1:]
+        remaining.discard(cur_room)
+
+    cur = tour[-1]
+    while remaining:
+        cost = np.ones(graph.n_cells)               # solo transito, nessuna penalità revisit
+        dist, came = graph.weighted_paths(cur, cost, allowed=region)
+        best_room, best_d, best_entry = None, np.inf, None
+        for rm in remaining:
+            cells = np.flatnonzero(region & (room == rm))
+            d = dist[cells]
+            if d.size == 0 or not np.isfinite(d.min()):
+                continue
+            j = int(np.argmin(d))
+            if d[j] < best_d:
+                best_d, best_room, best_entry = d[j], rm, int(cells[j])
+        if best_room is None:
+            break                                    # stanze restanti irraggiungibili da qui
+        tour += graph.trace(came, best_entry)[1:]
+        tour += _best_axis_sweep(region & (room == best_room), tour[-1])[1:]
+        cur = tour[-1]
+        remaining.discard(best_room)
+
+    return tour
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — the expert policy
 # ---------------------------------------------------------------------------
@@ -468,20 +803,21 @@ def plan_tour(graph: TraversabilityGraph, region: np.ndarray, start: int,
 class BoscoExpert:
     """Deterministic joint policy: `reset(positions)` then `act(...)` per step."""
 
-    def __init__(self, env, *, lookahead: int = 16, pursuit_dist: float = 0.25,
+    def __init__(self, env, *, map_id: int = 0, lookahead: int = 16, pursuit_dist: float = 0.25,
                  turn_threshold: float = 0.10, open_turn_threshold: float = 0.7,
                  open_clearance: float = 0.25, k_omega: float = 3.0,
                  arrive_tol: float = 0.06, shortcut_margin: float = 0.015,
                  yield_radius_factor: float = 4.0, yield_limit: int = 25,
                  stuck_limit: int = 6, spin_steps: int = 8, fail_limit: int = 3,
-                 revisit_penalty: float = REVISIT_PENALTY, skip_horizon: int = 4):
+                 revisit_penalty: float = REVISIT_PENALTY, skip_horizon: int = 4,
+                 idle_limit: int = 80):
         self.env = env
         self.n = env.num_robots
         self.dt = env.dt
         self.v_max = env.v_max
         self.omega_max = env.omega_max
 
-        self.graph = TraversabilityGraph(env)
+        self.graph = TraversabilityGraph(env, map_id=map_id)
         self.lookahead = int(lookahead)
         self.pursuit_dist = float(pursuit_dist)
         self.turn_threshold = float(turn_threshold)
@@ -497,6 +833,15 @@ class BoscoExpert:
         self.spin_steps = int(spin_steps)
         self.revisit_penalty = float(revisit_penalty)
         self.skip_horizon = int(skip_horizon)
+        # Longest run of steps a robot may legitimately spend without leaving an
+        # `arrive_tol` ball: a yield (`yield_limit`) followed by a turn in place
+        # (pi / omega_max seconds) is the worst honest case, so anything past
+        # this is a livelock, not a manoeuvre.
+        self.idle_limit = int(idle_limit)
+        # Centre distance below which two robots count as wedged: their discs are
+        # in contact at 2 * robot_radius, and the environment rejects every move
+        # that would close the gap further.
+        self.wedge_dist = 2.4 * env.robot_radius
 
         # Cells the env counts as coverable but no edge can reach (pockets sealed
         # by a wall the disc cannot squeeze past). Reported, never planned for.
@@ -507,7 +852,10 @@ class BoscoExpert:
 
     # -- episode setup ------------------------------------------------------
 
-    def reset(self, positions: np.ndarray) -> dict:
+    def reset(self, positions: np.ndarray, map_id: int | None = None) -> dict:
+        if map_id is not None and int(map_id) != self.graph.map_id:
+            self.graph = TraversabilityGraph(self.env, map_id=int(map_id))
+            self._isolated = self.graph.free & (self.graph.degree == 0)
         g = self.graph
         starts = g.cell_of(np.asarray(positions, dtype=np.float32))
         self.owner = partition_cells(g, starts)
@@ -516,11 +864,14 @@ class BoscoExpert:
         # component no robot spawned in, so they are unwinnable this episode and
         # must stay out of every mop-up search.
         self.unreachable = g.free & (self.owner < 0)
-        self.tours = [plan_tour(g, self.regions[r], int(starts[r]), self.revisit_penalty)
-                      for r in range(self.n)]
+        self.tours = [plan_tour_room_aware(g, self.regions[r], int(starts[r]), self.revisit_penalty)
+              for r in range(self.n)]
 
         self.idx = np.zeros(self.n, dtype=np.int64)          # cursor into the tour
         self.tgt = np.full(self.n, -1, dtype=np.int64)       # committed leg end
+        # Length of the covered head of the current plan: the transit the robot
+        # has already accepted, which `_skip_covered` must not try to avoid again.
+        self.commit = np.zeros(self.n, dtype=np.int64)
         # Anchor of the very first leg of a plan, frozen at plan time. Anchoring
         # it on the live pose instead would move the reference line under the
         # controller every step and leave the robot creeping in a limit cycle.
@@ -528,6 +879,10 @@ class BoscoExpert:
         self.prev_pos = np.asarray(positions, dtype=np.float32).copy()
         self.prev_v = np.zeros(self.n, dtype=np.float32)
         self.stuck = np.zeros(self.n, dtype=np.int32)
+        # Pose-only idle watchdog: last position the robot demonstrably left,
+        # and how long ago it left it.
+        self.watch_pos = np.asarray(positions, dtype=np.float32).copy()
+        self.idle = np.zeros(self.n, dtype=np.int32)
         self.fails = np.zeros(self.n, dtype=np.int32)
         self.spin = np.zeros(self.n, dtype=np.int32)
         self.yielding = np.zeros(self.n, dtype=np.int32)
@@ -567,6 +922,23 @@ class BoscoExpert:
         self.stuck = np.where(blocked, self.stuck + 1, 0)
         self.prev_pos = pos.copy()
 
+        # Pose-only idle watchdog. The test above only sees a robot that was
+        # *told to drive*, so every livelock in which the expert itself commands
+        # v = 0 is invisible to it — a plan whose next node is the cell already
+        # underfoot, a leg with no distance left to run, a splice that rebuilds
+        # itself every step. Those are precisely the failures that used to park a
+        # robot for the rest of the episode. This watchdog watches the pose and
+        # nothing else: a robot that has not left an `arrive_tol` ball in
+        # `idle_limit` steps is not sweeping, whatever its plan believes, and is
+        # forced through the same spin-and-replan recovery as a blocked one.
+        drifted = np.linalg.norm(pos - self.watch_pos, axis=1) > 2.0 * self.arrive_tol
+        self.watch_pos = np.where(drifted[:, None], pos, self.watch_pos)
+        self.idle = np.where(drifted, 0, self.idle + 1)
+        idle_out = (self.idle >= self.idle_limit) & ~self.done
+        if idle_out.any():
+            self.idle = np.where(idle_out, 0, self.idle)
+            self.spin = np.where(idle_out, self.spin_steps, self.spin)
+
         aim = np.zeros((self.n, 2), dtype=np.float32)      # pure-pursuit point
         remaining = np.zeros(self.n, dtype=np.float32)     # distance left on leg
         halt = np.zeros(self.n, dtype=bool)
@@ -580,12 +952,14 @@ class BoscoExpert:
                 self.spin[r] -= 1
                 spin_now[r] = True
                 aim[r] = pos[r]
-                if self.spin[r] == 0:
+                if self.spin[r] == 0 and not self._unwedge(r, int(cur_cell[r]), pos):
                     self._replan(r, int(cur_cell[r]), covered, pos)
                 continue
-            # Recovery ladder: a fresh plan is enough for a one-off block (a
-            # teammate crossing, a clipped corner). Spinning is reserved for a
-            # robot that keeps failing, since it throws away a known heading.
+            # Recovery ladder: pull clear of a teammate first — while two bodies
+            # are in contact no route is drivable, so replanning one is wasted —
+            # then a fresh plan for a one-off block (a teammate crossing, a
+            # clipped corner). Spinning is reserved for a robot that keeps
+            # failing, since it throws away a known heading.
             if self.stuck[r] >= self.stuck_limit:
                 self.stuck[r] = 0
                 self.fails[r] += 1
@@ -595,39 +969,29 @@ class BoscoExpert:
                     spin_now[r] = True
                     aim[r] = pos[r]
                     continue
-                self._replan(r, int(cur_cell[r]), covered, pos)
+                if not self._unwedge(r, int(cur_cell[r]), pos):
+                    self._replan(r, int(cur_cell[r]), covered, pos)
                 tour = self.tours[r]     # the old plan is gone; do not index it
 
-            # A node counts as reached only when the robot is *on its centre*,
-            # not merely inside its cell. Advancing on cell entry would anchor
-            # the next leg up to a quarter-cell off the lattice line, and the
-            # lanes flanking the inner walls have only 0.01 m to give.
-            i = int(self.idx[r])
-            # Arriving at the committed leg end retires every node it shortcut
-            # past; those cells were crossed by the leg, which is the condition
-            # the shortcut was accepted under. Without this the cursor would wait
-            # forever on a centre the straight leg legitimately bypassed.
-            j = int(self.tgt[r])
-            if i <= j < len(tour) and np.linalg.norm(
-                    pos[r] - g.centers[tour[j]]) < self.arrive_tol:
-                i = j + 1
-            while i < len(tour) and np.linalg.norm(
-                    pos[r] - g.centers[tour[i]]) < self.arrive_tol:
-                i += 1
-            if i > int(self.idx[r]):                 # real progress: forgive
+            i0 = int(self.idx[r])
+            i = self._retire_reached(r, pos[r])
+            if i > i0:                               # real progress: forgive
                 self.fails[r] = 0
-            self.idx[r] = i
 
             # Ground someone else already swept is worth going around, not over.
-            if i < len(tour) and covered[tour[i]]:
+            # Only past the accepted transit, though: the head of a plan is
+            # covered by construction — a transit crosses swept ground — so
+            # re-testing it here would splice the same detour every step and put
+            # the cursor back to 0 for ever, which is a robot frozen on the spot.
+            if i < len(tour) and covered[tour[i]] and i >= int(self.commit[r]):
                 self._skip_covered(r, int(cur_cell[r]), covered, pos[r])
                 tour = self.tours[r]        # spliced, or the cursor was retired
-                i = int(self.idx[r])
+                i = self._retire_reached(r, pos[r])
 
             if i >= len(tour):                       # tour finished -> mop up
                 self._replan(r, int(cur_cell[r]), covered, pos)
                 tour = self.tours[r]
-                i = int(self.idx[r])
+                i = self._retire_reached(r, pos[r])
                 if i >= len(tour):                   # nothing left anywhere
                     self.done[r] = True
                     halt[r] = True
@@ -648,7 +1012,13 @@ class BoscoExpert:
             leg = goal - anchor
             leg_len = float(np.linalg.norm(leg))
             if leg_len < 1e-6:
-                aim[r] = goal
+                # The plan is asking the robot to drive to the point it is
+                # already standing on. Retiring the node is the only answer that
+                # makes progress: commanding v = 0 and keeping the cursor put
+                # reproduces the same degenerate leg on the next step, which is a
+                # robot parked for good.
+                self.idx[r] = i + 1
+                aim[r] = pos[r]
                 remaining[r] = 0.0
                 continue
             u = leg / leg_len
@@ -656,7 +1026,12 @@ class BoscoExpert:
             # error decays as the robot converges on the line.
             t = float(np.clip(np.dot(pos[r] - anchor, u), 0.0, leg_len))
             aim[r] = anchor + u * min(leg_len, t + self.pursuit_dist)
-            remaining[r] = leg_len - t
+            # Distance still to travel, used below to keep the robot from
+            # overshooting the leg end. It is the larger of the run left along
+            # the line and the true distance to the goal: a robot shoved past the
+            # end of its leg has zero of the former but still has to drive back,
+            # and pricing that at zero would cap its speed at zero for good.
+            remaining[r] = max(leg_len - t, float(np.linalg.norm(goal - pos[r])))
 
         # --- Pure pursuit, vectorised over robots ---
         delta = aim - pos
@@ -720,6 +1095,35 @@ class BoscoExpert:
 
     # -- helpers ------------------------------------------------------------
 
+    def _retire_reached(self, r: int, p: np.ndarray) -> int:
+        """Retire every tour node the robot is already standing on. Returns the cursor.
+
+        A node counts as reached only when the robot is *on its centre*, not
+        merely inside its cell: advancing on cell entry would anchor the next leg
+        up to a quarter-cell off the lattice line, and the lanes flanking the
+        inner walls have only 0.01 m to give.
+
+        This runs again after every mid-step replan, which is what keeps a fresh
+        plan from producing a zero-length first leg: a plan always starts at the
+        cell the robot occupies, and if it is already on that centre the node is
+        nothing left to drive to.
+        """
+        g, tour = self.graph, self.tours[r]
+        i = int(self.idx[r])
+        # Arriving at the committed leg end retires every node it shortcut past;
+        # those cells were crossed by the leg, which is the condition the shortcut
+        # was accepted under. Without this the cursor would wait forever on a
+        # centre the straight leg legitimately bypassed.
+        j = int(self.tgt[r])
+        if i <= j < len(tour) and np.linalg.norm(
+                p - g.centers[tour[j]]) < self.arrive_tol:
+            i = j + 1
+        while i < len(tour) and np.linalg.norm(
+                p - g.centers[tour[i]]) < self.arrive_tol:
+            i += 1
+        self.idx[r] = i
+        return i
+
     def _shortcut(self, p: np.ndarray, tour: list[int], i: int) -> int:
         """Farthest tour node reachable in a straight line without skipping cells.
 
@@ -742,16 +1146,77 @@ class BoscoExpert:
                 return j
         return i
 
-    def _adopt(self, r: int, path: list[int], cell: int, pos: np.ndarray) -> None:
+    def _adopt(self, r: int, path: list[int], cell: int, pos: np.ndarray,
+               covered: np.ndarray | None = None) -> None:
         """Install `path` as robot r's tour and put the cursor back on the lattice.
 
         Cursor 0 makes the robot re-acquire its own cell centre first, which
         puts it back on the lattice line before the new leg starts.
+
+        The covered head of the new plan is recorded as a *commitment*. Every
+        path this planner builds starts on the cell the robot occupies and reaches
+        its goal across whatever ground lies between, so its first cells are
+        covered by construction. Without the commitment `_skip_covered` reads that
+        head as a stretch worth detouring around, rebuilds the very same transit,
+        resets the cursor to 0, and does it again on the next step — a robot
+        replanning itself into a standstill it can never leave.
         """
         self.tours[r] = path if path else [int(cell)]
         self.idx[r] = 0
         self.tgt[r] = -1
         self.anchor0[r] = pos
+        # A robot with somewhere to go is not finished. Leaving the flag latched
+        # would exempt it from the idle watchdog for the rest of the episode.
+        self.done[r] = not path
+        k = 0
+        if covered is not None:
+            tour = self.tours[r]
+            while k < len(tour) and covered[tour[k]]:
+                k += 1
+        self.commit[r] = k
+
+    def _unwedge(self, r: int, cell: int, positions: np.ndarray) -> bool:
+        """Break a body-to-body wedge by driving away from the teammate.
+
+        Two robots pressed together at 2 * robot_radius cannot be separated by
+        replanning: every plan starts at the cell the robot occupies, so both keep
+        aiming at a centre the other one is sitting on and the environment rejects
+        every move as a collision. What they need is not a better route but a
+        metre of clearance, so the escape leg deliberately ignores coverage and
+        heads for whichever neighbouring cell opens the gap fastest.
+
+        The leg runs from the live pose, not from a cell centre — the robot is
+        wedged precisely because it cannot reach its own centre — so the straight
+        line is checked against the walls at the full robot radius before it is
+        accepted. Returns False when nothing is wedged or nothing opens up.
+        """
+        g = self.graph
+        pos = positions[r]
+        others = np.ones(len(positions), dtype=bool)
+        others[r] = False
+        if not others.any():
+            return False
+        rel = positions[others] - pos[None, :]
+        d = np.linalg.norm(rel, axis=1)
+        if d.min() > self.wedge_dist:
+            return False
+
+        blocker = positions[others][int(np.argmin(d))]
+        best, best_gap = None, -np.inf
+        for nb in g.neighbors[cell]:
+            nb = int(nb)
+            if nb < 0:
+                continue
+            centre = g.centers[nb]
+            gap = float(np.linalg.norm(centre - blocker))
+            if gap > best_gap and g.los_clear(pos, centre):
+                best, best_gap = nb, gap
+        if best is None:
+            return False
+        # A single-node plan whose leg starts at the pose: the head that would
+        # normally re-acquire this cell's centre is exactly what cannot be done.
+        self._adopt(r, [best], cell, pos)
+        return True
 
     def _replan(self, r: int, cell: int, covered: np.ndarray,
                 positions: np.ndarray) -> None:
@@ -769,14 +1234,25 @@ class BoscoExpert:
         up for the rest of an episode.
         """
         g = self.graph
+        # Teammates only. Masking every robot's cell and then clearing `cell`
+        # "so you never block yourself" also clears a teammate standing in the
+        # *same* cell as this robot — and two robots in one cell then plan the
+        # identical route to the identical cell centre, which is a wedge neither
+        # of them can leave. Excluding self by index instead keeps the teammate
+        # visible whether or not it shares the cell.
         occupied = np.zeros(g.n_cells, dtype=bool)
-        occupied[g.cell_of(positions)] = True
-        occupied[cell] = False                       # never block yourself
+        others = np.ones(len(positions), dtype=bool)
+        others[r] = False
+        occupied[g.cell_of(positions[others])] = True
+        # The robot may always stand where it already stands, even if a teammate
+        # is pressed into the same cell; otherwise the search has no source.
+        passable = ~occupied
+        passable[cell] = True
 
         cost = np.where(covered, 1.0 + self.revisit_penalty, 1.0)
         pending = g.free & ~covered & ~self._isolated & ~self.unreachable & ~occupied
         path = g.nearest_path(cell, pending & self.regions[r], cost,
-                              allowed=self.regions[r] & ~occupied)
+                              allowed=self.regions[r] & passable)
         if path is None:
             # Own region done: help elsewhere, but only with the leftovers this
             # robot is closest to. Without that split every free robot converges
@@ -784,8 +1260,19 @@ class BoscoExpert:
             # each other out of it.
             d = np.linalg.norm(g.centers[None, :, :] - positions[:, None, :], axis=2)
             path = g.nearest_path(cell, pending & (np.argmin(d, axis=0) == r), cost,
-                                  allowed=~occupied)
-        self._adopt(r, path, cell, positions[r])
+                                  allowed=passable)
+        if path is None:
+            # The split is a preference, not a rule. Holding to it when it leaves
+            # this robot nothing to do parks a working robot next to cells no one
+            # else has claimed — the nearest-robot assignment is only a tie-break,
+            # so once it comes up empty the whole remainder is fair game.
+            path = g.nearest_path(cell, pending, cost, allowed=passable)
+        if path is None:
+            # Last resort: teammates standing on the way are transient, so retry
+            # without treating them as walls rather than declaring the map done.
+            path = g.nearest_path(cell, g.free & ~covered & ~self._isolated
+                                  & ~self.unreachable, cost)
+        self._adopt(r, path, cell, positions[r], covered)
 
     def _skip_covered(self, r: int, cell: int, covered: np.ndarray,
                       pos: np.ndarray) -> bool:
@@ -823,7 +1310,7 @@ class BoscoExpert:
         path = g.trace(came, tour[k])
         if not path:
             return False
-        self._adopt(r, path + tour[k + 1:], cell, pos)
+        self._adopt(r, path + tour[k + 1:], cell, pos, covered)
         return True
 
 
@@ -844,7 +1331,8 @@ def run_episode(env, expert: BoscoExpert, key, collect: bool = False):
     obs_fn = env._bosco_obs
 
     state = env.reset(key)
-    plan = expert.reset(np.asarray(state.robot_positions))
+    plan = expert.reset(np.asarray(state.robot_positions),
+                        map_id=int(jax.device_get(state.map_id)))
 
     obs_buf, act_buf = [], []
     collisions = 0

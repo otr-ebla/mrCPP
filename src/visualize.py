@@ -190,7 +190,7 @@ def main() -> None:
     lidar_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
 
     env = MultiRobotCoverageEnv()
-    env.reset(seed=42)
+    env.reset()
 
     step  = 0
     speed = 1      # physics steps per rendered frame

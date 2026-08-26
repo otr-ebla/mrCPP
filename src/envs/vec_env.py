@@ -49,6 +49,7 @@ class VecEnv:
 
         self.reset = jax.jit(self._reset)
         self.step = jax.jit(self._step)
+        self.update_bosco = jax.jit(self._update_bosco)
 
     @property
     def num_robots(self) -> int:
@@ -137,3 +138,10 @@ class VecEnv:
                     info, self.env.get_global_state(s))
 
         return jax.vmap(one)(state, actions)
+
+    def _update_bosco(self, state: EnvState, targets: jax.Array):
+        """Returns updated (state, obs, gstate) from new bosco targets (E, N, 2)"""
+        def one(s: EnvState, t: jax.Array):
+            s_new = self.env.set_bosco_targets(s, t)
+            return s_new, self.env.get_obs(s_new), self.env.get_global_state(s_new)
+        return jax.vmap(one)(state, targets)

@@ -47,6 +47,11 @@ MARGIN     = 40   # pixel border around the map
 HUD_HEIGHT = 50   # pixels for the stats bar at the bottom
 FPS        = 30
 
+# Speed levels (FPS) cycled by pressing 'S' during playback.
+# Each step doubles the previous; the first entry is the default speed.
+SPEED_LEVELS  = [30, 60, 120, 240, 0]   # 0 = uncapped (run as fast as possible)
+_SPEED_LABELS = ['1×', '2×', '4×', '8×', '∞']
+
 # Step budget BOSCO needs to finish the default map; see src/algorithms/bosco.py.
 _BOSCO_MIN_STEPS = 3000
 
@@ -138,6 +143,7 @@ def _draw_frame(
     surface: pygame.Surface,
     env: MultiRobotCoverageEnv,
     walls: np.ndarray,
+    free: np.ndarray,
     snap: dict,
     font: pygame.font.Font,
     ep_reward: float,
@@ -145,9 +151,10 @@ def _draw_frame(
     owner: np.ndarray | None = None,
     palette: np.ndarray | None = None,
     label: str = '',
+    speed_label: str = '1×',
 ) -> None:
-    mw = env.map_layout.width
-    mh = env.map_layout.height
+    mw = env.grid_w * env.cell_size
+    mh = env.grid_h * env.cell_size
     cs = env.cell_size
 
     surface.fill(COLORS['bg'])
@@ -158,7 +165,6 @@ def _draw_frame(
     # work that can never be done.
     cell_px = int(cs * SCALE)
     grid = snap['coverage_grid']
-    free = env.free_mask_np
     show_owner = owner is not None and palette is not None
     for row in range(env.grid_h):
         for col in range(env.grid_w):
@@ -242,7 +248,8 @@ def _draw_frame(
             f"Coverage {snap['coverage_ratio']:5.1%} "
             f"({snap['covered_cells']}/{snap['total_cells']}) | "
             f"Reward {ep_reward:8.2f} | "
-            f"[ESC] quit [R] reset [L] lidar [O] owners")
+            f"Speed {speed_label} | "
+            f"[ESC] quit [R] reset [L] lidar [O] owners [S] speed")
     rendered = font.render(text, True, COLORS['hud_text'])
     line_h = rendered.get_height()
     top = win_h - HUD_HEIGHT + (HUD_HEIGHT - (2 * line_h if show_owner else line_h)) // 2
@@ -319,7 +326,8 @@ class BoscoController:
         self.owner = None
 
     def reset(self, state) -> None:
-        info = self.expert.reset(np.asarray(state.robot_positions))
+        current_map_id = int(jax.device_get(state.map_id))
+        info = self.expert.reset(np.asarray(state.robot_positions), map_id=current_map_id)
         # -1 (unowned) folds onto the palette's trailing fallback row.
         owner = self.expert.owner.copy()
         owner[owner < 0] = self.env.num_robots
@@ -341,7 +349,6 @@ def run_episode(
     surface: pygame.Surface,
     clock: pygame.time.Clock,
     font: pygame.font.Font,
-    walls: np.ndarray,
     palette: np.ndarray,
     fps: int,
     view_state: dict,
@@ -351,8 +358,12 @@ def run_episode(
     controller.reset(state)
 
     ep_reward = 0.0
-    # The snapshot is taken before the step rather than after it, so the same
-    # host arrays serve both the renderer and a host-side controller.
+    
+    # Extract the map_id for this episode and fetch the specific walls/free mask
+    current_map_id = int(jax.device_get(state.map_id))
+    current_walls = np.asarray(env.walls[current_map_id])
+    current_free = np.asarray(env.free_mask_np[current_map_id])
+
     snap = _snapshot(env, state, view_state['show_lidar'])
 
     while True:
@@ -368,20 +379,32 @@ def run_episode(
                     view_state['show_lidar'] = not view_state['show_lidar']
                 if event.key == pygame.K_o:
                     view_state['show_owner'] = not view_state['show_owner']
+                if event.key == pygame.K_s:
+                    view_state['speed_idx'] = (
+                        view_state['speed_idx'] + 1) % len(SPEED_LEVELS)
+
+        speed_idx   = view_state['speed_idx']
+        current_fps = SPEED_LEVELS[speed_idx]
+        speed_label = _SPEED_LABELS[speed_idx]
 
         owner = controller.owner if view_state['show_owner'] else None
-        _draw_frame(surface, env, walls, snap, font, ep_reward,
-                    view_state['show_lidar'], owner, palette, controller.label)
+        
+        # USA current_walls INVECE DI walls
+        _draw_frame(surface, env, current_walls, current_free, snap, font,
+                    ep_reward, view_state['show_lidar'], owner, palette,
+                    controller.label, speed_label)
         pygame.display.flip()
-        clock.tick(fps)
+        clock.tick(current_fps)
 
         state, rewards, terminated, truncated = controller.step(state, snap)
         ep_reward += float(jnp.mean(rewards))
         snap = _snapshot(env, state, view_state['show_lidar'])
 
         if bool(terminated) or bool(truncated):
-            _draw_frame(surface, env, walls, snap, font, ep_reward,
-                        view_state['show_lidar'], owner, palette, controller.label)
+            # USA current_walls INVECE DI walls
+            _draw_frame(surface, env, current_walls, current_free, snap, font,
+                        ep_reward, view_state['show_lidar'], owner, palette,
+                        controller.label, speed_label)
             pygame.display.flip()
             return ep_reward
 
@@ -461,7 +484,7 @@ def main() -> None:
         env_cfg = {**env_cfg, 'max_steps': _BOSCO_MIN_STEPS}
 
     env   = MultiRobotCoverageEnv(env_cfg)
-    walls = np.asarray(env.walls)
+    #walls = np.asarray(env.walls)
 
     if args.policy == 'bosco':
         controller = BoscoController(env)
@@ -490,8 +513,9 @@ def main() -> None:
         controller = MappoController(env, actor, params, obs_rms)
 
     # -- Pygame setup --
-    mw    = env.map_layout.width
-    mh    = env.map_layout.height
+    # -- Pygame setup --
+    mw    = env.grid_w * env.cell_size
+    mh    = env.grid_h * env.cell_size
     win_w = int(mw * SCALE) + 2 * MARGIN
     win_h = int(mh * SCALE) + 2 * MARGIN + HUD_HEIGHT
 
@@ -503,7 +527,8 @@ def main() -> None:
 
     palette = _ownership_palette(env.num_robots)
     # The overlay only has something to say once a partition exists.
-    view_state = {'show_lidar': False, 'show_owner': args.policy == 'bosco'}
+    view_state = {'show_lidar': False, 'show_owner': args.policy == 'bosco',
+                  'speed_idx': 0}
     key = jax.random.PRNGKey(args.seed)
 
     ep_num = 0
@@ -512,7 +537,7 @@ def main() -> None:
             key, ep_key = jax.random.split(key)
             print(f"Episode {ep_num + 1} ...", end='', flush=True)
             ret = run_episode(env, controller, ep_key, surface, clock, font,
-                              walls, palette, args.fps, view_state)
+                               palette, args.fps, view_state)
             if ret is None:
                 print("  (quit)")
                 break
