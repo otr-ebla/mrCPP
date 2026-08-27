@@ -293,7 +293,8 @@ LOG_NAME        = 'training_log_bosco.csv'
 
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 2.0,
-          wandb_overrides: dict | None = None, num_humans: int = 0):
+          wandb_overrides: dict | None = None, num_humans: int = 0,
+          num_envs: int | None = None):
     config = load_config(config_path)
     device = select_device(backend)
     print(f"Device: {describe(device)}  |  requested: {backend or 'auto'}")
@@ -303,6 +304,11 @@ def train(config_path: str, save_dir: str, resume: str | None,
         env_cfg['num_humans'] = num_humans
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
+    
+    if num_envs is not None:
+        train_cfg['num_envs'] = num_envs
+    elif device.platform == 'gpu' and train_cfg.get('num_envs', 8) <= 16:
+        train_cfg['num_envs'] = 1024
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
@@ -576,14 +582,14 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 best_mean_reward = mean_ep_r
                 save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
                                 update, actor_state, critic_state, carry.rms,
-                                GUIDE_DIM)
+                                tail_dim)
                 print(f"  → best policy saved (mean_ep_r={mean_ep_r:.3f})")
                 if run is not None:
                     run.summary['best_mean_ep_reward'] = mean_ep_r
                     run.summary['best_update'] = update
 
     save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
-                    total_updates, actor_state, critic_state, carry.rms)
+                    total_updates, actor_state, critic_state, carry.rms, tail_dim)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms
@@ -626,6 +632,7 @@ if __name__ == '__main__':
                         choices=['online', 'offline', 'disabled'],
                         help='W&B mode; "offline" logs locally with no network')
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
+    parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 1024 on GPU if config uses <=16)')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
@@ -637,4 +644,4 @@ if __name__ == '__main__':
               'name':    args.wandb_name,
               'group':   args.wandb_group,
               'mode':    args.wandb_mode,
-          }, num_humans=args.humans)
+          }, num_humans=args.humans, num_envs=args.envs)
