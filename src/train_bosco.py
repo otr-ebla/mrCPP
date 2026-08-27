@@ -67,6 +67,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from src.algorithms.bosco_guide import make_guides
+from src.algorithms.jax_bosco import JaxGuideState, jax_guide_step
 from src.algorithms.mappo import (
     MAPPO,
     RunningMeanStd,
@@ -155,26 +156,16 @@ def load_checkpoint(path: str, actor_state, critic_state, device,
 # ---------------------------------------------------------------------------
 
 class GuidedCarry(NamedTuple):
-    """Rollout state threaded between updates. Not a pytree: `guides` are host
-    objects and `targets` is numpy, so this is never tree_map'd."""
+    """Rollout state threaded between updates."""
 
     env_state: object
     obs:       jax.Array      # already carries the guidance block
     gstate:    object
-    rms:       RunningMeanStd
-    targets:   np.ndarray     # (E, N) flat cell index, -1 when idle
+    rms:       object
+    guide_state: JaxGuideState
 
 
 class GuidedRollout:
-    """Collects T steps with the BOSCO waypoint in the loop.
-
-    One jitted call produces the action, the log-probability and the value; one
-    jitted call steps every environment; one `device_get` brings back the three
-    host arrays the planner reads (poses, headings, coverage grid). The waypoint
-    and the arrival bonus are computed between them, which is the only reason
-    this is a python loop at all.
-    """
-
     def __init__(self, mappo: MAPPO, vec_env: VecEnv, guides, guide_bonus: float):
         self.mappo = mappo
         self.env = vec_env
@@ -185,9 +176,6 @@ class GuidedRollout:
 
         @jax.jit
         def act(actor_params, critic_params, rms, obs, gstate, key):
-            # Statistics are refreshed on the raw observation before it is
-            # normalised, exactly as in `MAPPO.rollout`. `rms` covers only the
-            # continuous prefix, so the guidance tail passes through untouched.
             rms = rms_update(rms, obs.reshape(e * n, -1))
             obs_n = rms_normalize(rms, obs)
 
@@ -202,85 +190,119 @@ class GuidedRollout:
 
         self._act = act
         self._value_fn = jax.jit(mappo._values)
+        
+        # JIT the entire T-step scan!
+        @jax.jit
+        def jitted_run(actor_params, critic_params, carry, keys):
+            def scan_step(c, k):
+                state, obs, gstate, rms, guide_state = c
+                
+                obs_n, action, z, log_prob, value, rms = act(
+                    actor_params, critic_params, rms, obs, gstate, k
+                )
+                next_state, _, reward, term, done, info, _ = vec_env.step(state, action)
+                
+                import jax.numpy as jnp
+                from src.algorithms.jax_bosco import jax_guide_step
+                
+                new_guide_state, waypoint, reached = jax_guide_step(
+                    guide_state,
+                    next_state.robot_positions,
+                    next_state.coverage_grid,
+                    done,
+                    jnp.asarray(self.graph.neighbors, jnp.int32),
+                    vec_env.grid_w,
+                    vec_env.grid_h,
+                    vec_env.env.cell_size,
+                    self.guides
+                )
+                
+                valid = waypoint >= 0
+                safe_targets = jnp.maximum(waypoint, 0)
+                coords = jnp.asarray(self.graph.centers)[safe_targets]
+                target_coords = jnp.where(valid[..., None], coords, next_state.robot_positions)
+                
+                next_state, next_obs, next_gstate = vec_env.update_bosco(next_state, target_coords)
+                
+                trans = Transition(
+                    obs=obs_n,
+                    gstate=gstate,
+                    action=action,
+                    z=z,
+                    log_prob=log_prob,
+                    reward=(reward + self.bonus * jnp.asarray(reached, jnp.float32)) * self.mappo.reward_scale,
+                    value=value,
+                    term=term.astype(jnp.float32),
+                    done=done.astype(jnp.float32),
+                    coverage=info['coverage_ratio'],
+                    wall_hit=info['wall_collision_rate'],
+                    robot_hit=info['robot_collision_rate'],
+                    complete=info['complete'],
+                    timeout=info['timeout'],
+                )
+                
+                next_carry = GuidedCarry(next_state, next_obs, next_gstate, rms, new_guide_state)
+                return next_carry, (trans, reached)
+                
+            return jax.lax.scan(scan_step, carry, keys)
 
-    def _get_target_coords(self, pos: np.ndarray, targets: np.ndarray) -> np.ndarray:
-        valid = targets >= 0
-        safe_targets = np.maximum(targets, 0)
-        coords = self.graph.centers[safe_targets]
-        return np.where(valid[..., None], coords, pos)
+        self._jitted_run = jitted_run
 
     @staticmethod
     def _host(state, done=None):
-        """The planner's three arrays (and optionally `done`) in one transfer."""
         payload = (state.robot_positions, state.robot_headings, state.coverage_grid)
         return jax.device_get(payload if done is None else payload + (done,))
 
     def start(self, key: jax.Array) -> GuidedCarry:
         state, obs, gstate, _ = self.env.reset(key)
         pos, hdg, cov = self._host(state)
-        targets = np.full((self.env.E, self.env.num_robots), -1, dtype=np.int64)
-        for e in range(self.env.E):
+        E, N = self.env.E, self.env.num_robots
+        
+        MAX_TOUR_LEN = 2048
+        tours = np.full((E, N, MAX_TOUR_LEN), -1, dtype=np.int32)
+        tour_lens = np.zeros((E, N), dtype=np.int32)
+        targets = np.full((E, N), -1, dtype=np.int32)
+        
+        for e in range(E):
             self.guides[e].reset(pos[e])
+            for r in range(N):
+                tour = self.guides[e].tours[r]
+                t_len = len(tour)
+                tour_lens[e, r] = t_len
+                tours[e, r, :t_len] = tour[:MAX_TOUR_LEN]
             targets[e], _ = self.guides[e].update(pos[e], cov[e])
             
-        target_coords = self._get_target_coords(pos, targets)
+        valid = targets >= 0
+        safe_targets = np.maximum(targets, 0)
+        coords = self.graph.centers[safe_targets]
+        target_coords = np.where(valid[..., None], coords, pos)
+        
         state, obs, gstate = self.env.update_bosco(state, jnp.asarray(target_coords, dtype=jnp.float32))
         
-        return GuidedCarry(state, obs, gstate, rms_init(self.env.norm_dim), targets)
+        cell_size = self.env.env.cell_size
+        col = np.clip((pos[..., 0] / cell_size).astype(np.int32), 0, self.env.grid_w - 1)
+        row = np.clip((pos[..., 1] / cell_size).astype(np.int32), 0, self.env.grid_h - 1)
+        cell = row * self.env.grid_w + col
+        
+        guide_state = JaxGuideState(
+            target=jnp.asarray(targets, jnp.int32),
+            prev_cell=jnp.asarray(cell, jnp.int32),
+            fail_cov=jnp.full((E, N), -1, dtype=jnp.int32),
+            idx=jnp.zeros((E, N), dtype=jnp.int32),
+            tours=jnp.asarray(tours, jnp.int32),
+            tour_lens=jnp.asarray(tour_lens, jnp.int32)
+        )
+        
+        return GuidedCarry(state, obs, gstate, rms_init(self.env.norm_dim), guide_state)
 
-    def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int,
-            key: jax.Array):
-        """-> (carry, trajectory, bootstrap value, waypoint hits (T, E, N))."""
-        E, N = self.env.E, self.env.num_robots
-        state, obs, gstate, rms, targets = carry
+    def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int, key: jax.Array):
         keys = jax.random.split(key, num_steps)
-        buf, hits = [], np.zeros((num_steps, E, N), np.float32)
-
-        for t in range(num_steps):
-            obs_n, action, z, log_prob, value, rms = self._act(
-                actor_params, critic_params, rms, obs, gstate, keys[t]
-            )
-            next_state, _, reward, term, done, info, _ = self.env.step(
-                state, action
-            )
-
-            pos, hdg, cov, done_np = self._host(next_state, done)
-            reached = np.zeros((E, N), dtype=bool)
-            for e in range(E):
-                if done_np[e]:
-                    self.guides[e].reset(pos[e])
-                targets[e], reached[e] = self.guides[e].update(pos[e], cov[e])
-            hits[t] = reached
-
-            target_coords = self._get_target_coords(pos, targets)
-            next_state, next_obs, next_gstate = self.env.update_bosco(next_state, jnp.asarray(target_coords, dtype=jnp.float32))
-
-            buf.append(Transition(
-                obs=obs_n,
-                gstate=gstate,
-                action=action,
-                z=z,
-                log_prob=log_prob,
-                reward=(reward + self.bonus * jnp.asarray(reached, jnp.float32))
-                * self.mappo.reward_scale,
-                value=value,
-                term=term.astype(jnp.float32),
-                done=done.astype(jnp.float32),
-                coverage=info['coverage_ratio'],
-                wall_hit=info['wall_collision_rate'],
-                robot_hit=info['robot_collision_rate'],
-                complete=info['complete'],
-                timeout=info['timeout'],
-            ))
-
-            state, obs, gstate = next_state, next_obs, next_gstate
-
-        traj = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *buf)
-        last_value = self._value_fn(critic_params, gstate)
-        return GuidedCarry(state, obs, gstate, rms, targets), traj, last_value, hits
-
+        final_carry, (traj, hits) = self._jitted_run(actor_params, critic_params, carry, keys)
+        last_value = self._value_fn(critic_params, final_carry.gstate)
+        return final_carry, traj, last_value, hits
 
 # ---------------------------------------------------------------------------
+# Training loop----------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
