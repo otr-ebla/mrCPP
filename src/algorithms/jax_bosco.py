@@ -293,9 +293,17 @@ def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done, graph_n
     E, N = state.idx.shape
     C = w * h
     
-    # 1. Callback for resets
-    # If done is true for env e, tours and tour_lens are updated.
-    new_tours, new_tour_lens = jax_reset_guides(done, positions, state.tours, state.tour_lens, guides)
+    def do_reset():
+        return jax_reset_guides(done, positions, state.tours, state.tour_lens, guides)
+        
+    def skip_reset():
+        return state.tours, state.tour_lens
+        
+    new_tours, new_tour_lens = jax.lax.cond(
+        jnp.any(done),
+        do_reset,
+        skip_reset
+    )
     
     # Also reset idx, target, prev_cell, fail_cov for done envs
     idx = jnp.where(done[:, None], 0, state.idx)

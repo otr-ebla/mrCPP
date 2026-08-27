@@ -310,11 +310,13 @@ class MappoController:
     """
 
     label = 'MAPPO '
-    owner = None          # no partition to show
+    owner = None
 
     def __init__(self, env: MultiRobotCoverageEnv, actor: Actor, params,
                  obs_rms: RunningMeanStd | None):
         self.env, self.params, self.obs_rms = env, params, obs_rms
+        from src.algorithms.bosco import BoscoExpert
+        self.expert = BoscoExpert(env)
 
         @jax.jit
         def policy_step(params, rms, state, obs):
@@ -328,6 +330,11 @@ class MappoController:
 
     def reset(self, state) -> None:
         self.obs = self.env.get_obs(state)
+        current_map_id = int(jax.device_get(state.map_id))
+        self.expert.reset(np.asarray(state.robot_positions), map_id=current_map_id)
+        owner = self.expert.owner.copy()
+        owner[owner < 0] = self.env.num_robots
+        self.owner = owner.reshape(self.env.grid_h, self.env.grid_w)
 
     def step(self, state, snap: dict):
         state, self.obs, rewards, terminated, truncated = self._fn(
@@ -505,6 +512,7 @@ def main() -> None:
     env_cfg   = config.get('env',   {})
     if args.humans > 0:
         env_cfg['num_humans'] = args.humans
+    env_cfg['terminate_on_collision'] = True
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
 
@@ -566,7 +574,7 @@ def main() -> None:
 
     palette = _ownership_palette(env.num_robots)
     # The overlay only has something to say once a partition exists.
-    view_state = {'show_lidar': False, 'show_owner': args.policy == 'bosco',
+    view_state = {'show_lidar': False, 'show_owner': True,
                   'speed_idx': 0}
     key = jax.random.PRNGKey(args.seed)
 
