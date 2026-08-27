@@ -213,6 +213,8 @@ def _draw_frame(
     if show_lidar and snap['lidar'].size:
         angles_rel = np.linspace(0.0, 2.0 * np.pi, env.n_rays, endpoint=False)
         for i in range(env.num_robots):
+            ray_color = (_ROBOT_COLORS[i % len(_ROBOT_COLORS)] if snap['alive'][i]
+                         else COLORS['dead'])
             pos    = positions[i]
             angles = headings[i] + angles_rel
             dists  = snap['lidar'][i] * env.max_lidar_range   # stored normalised
@@ -220,7 +222,9 @@ def _draw_frame(
             ex = pos[0] + dists * np.cos(angles)
             ey = pos[1] + dists * np.sin(angles)
             for x, y in zip(ex, ey):
-                pygame.draw.line(surface, COLORS['lidar'], (cx, cy), _to_px(x, y, mh), 1)
+                tip_px, tip_py = _to_px(x, y, mh)
+                pygame.draw.line(surface, ray_color, (cx, cy), (tip_px, tip_py), 1)
+                pygame.draw.circle(surface, ray_color, (tip_px, tip_py), 3)
 
     # -- Robots --
     r_px = max(5, int(env.robot_radius * SCALE))
@@ -272,7 +276,7 @@ def _draw_frame(
             f"({snap['covered_cells']}/{snap['total_cells']}) | "
             f"Reward {ep_reward:8.2f} | "
             f"Speed {speed_label} | "
-            f"[ESC] quit [R] reset [L] lidar [O] owners [S] speed")
+            f"[ESC] quit [SPACE] pause [R] reset [L] lidar [O] owners [S] speed")
     rendered = font.render(text, True, COLORS['hud_text'])
     line_h = rendered.get_height()
     top = win_h - HUD_HEIGHT + (HUD_HEIGHT - (2 * line_h if show_owner else line_h)) // 2
@@ -396,6 +400,8 @@ def run_episode(
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return None
+                if event.key == pygame.K_SPACE:
+                    view_state['paused'] = not view_state.get('paused', False)
                 if event.key == pygame.K_r:
                     return ep_reward   # early reset
                 if event.key == pygame.K_l:
@@ -409,6 +415,8 @@ def run_episode(
         speed_idx   = view_state['speed_idx']
         current_fps = SPEED_LEVELS[speed_idx]
         speed_label = _SPEED_LABELS[speed_idx]
+        if view_state.get('paused', False):
+            speed_label = 'PAUSED'
 
         owner = controller.owner if view_state['show_owner'] else None
         
@@ -417,6 +425,11 @@ def run_episode(
                     ep_reward, view_state['show_lidar'], owner, palette,
                     controller.label, speed_label)
         pygame.display.flip()
+        
+        if view_state.get('paused', False):
+            clock.tick(60) # keep responsive
+            continue
+            
         clock.tick(current_fps)
 
         state, rewards, terminated, truncated = controller.step(state, snap)
