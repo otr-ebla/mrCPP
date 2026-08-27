@@ -37,7 +37,7 @@ env:
   # minimum than the one we are escaping. Scaled to per-step magnitudes it must
   # sit below alpha=10 (one discovered cell): 1.0 deters without paralysing.
   kappa: 1.0             # collision penalty per step, charged to the offender
-  tau: 0.05              # per-step time penalty
+  tau: 0.15              # per-step time penalty
   # beta < tau is a hard constraint checked by the env: crossing an already
   # covered cell must be cheaper than idling, or robots learn to freeze rather
   # than drive through explored ground to reach new ground
