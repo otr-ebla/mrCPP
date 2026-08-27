@@ -486,7 +486,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
         robot_hit = np.asarray(traj.robot_hit)
         complete  = np.asarray(traj.complete)
         timeout   = np.asarray(traj.timeout)
-        hit_rate_t = hits.mean(axis=2)             # (T, E) team-mean per step
+        hit_rate_t = np.asarray(hits).mean(axis=2)             # (T, E) team-mean per step
         for t in range(T):
             ep_reward += team_rewards[t]
             ep_len    += 1
