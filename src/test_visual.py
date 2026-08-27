@@ -533,7 +533,7 @@ def main() -> None:
             action_dim=env.action_dim,
             vec_dim=env.obs_vec_dim,
             n_rays=env.n_rays,
-            patch_dim=env.patch_dim,
+            tail_dim=env.patch_dim,
             lidar_embed=model_cfg.get('lidar_embed',  64),
             hidden_size=model_cfg.get('hidden_size', 128),
         )

@@ -291,23 +291,6 @@ CHECKPOINT_NAME = 'checkpoint_bosco.pkl'
 LOG_NAME        = 'training_log_bosco.csv'
 
 
-class _WidenedEnv:
-    """`vec_env` with the guided observation width.
-
-    `MAPPO.create_train_states` reads `obs_dim` off the environment to shape the
-    dummy observation it initialises the actor with, and the environment cannot
-    report a width that includes a block it does not produce. Only that one field
-    differs, so everything else is forwarded.
-    """
-
-    def __init__(self, vec_env: VecEnv, obs_dim: int):
-        self._env = vec_env
-        self.obs_dim = obs_dim
-
-    def __getattr__(self, name):
-        return getattr(self._env, name)
-
-
 def train(config_path: str, save_dir: str, resume: str | None,
           backend: str | None = None, guide_bonus: float = 2.0,
           wandb_overrides: dict | None = None, num_humans: int = 0):
@@ -329,19 +312,19 @@ def train(config_path: str, save_dir: str, resume: str | None,
     # The guidance block rides in the observation tail, where the actor's `patch`
     # slice picks it up and feeds it straight to the trunk alongside the binary
     # coverage patch. Both are inputs no normaliser should touch.
-    tail_dim = env.patch_dim + GUIDE_DIM
-    obs_dim  = env.obs_dim + GUIDE_DIM
+    tail_dim = env.patch_dim
+    obs_dim = env.obs_dim
 
     lidar_embed = model_cfg.get('lidar_embed',  64)
     hidden_size = model_cfg.get('hidden_size', 128)
     trunk_in    = lidar_embed + env.obs_vec_dim + tail_dim
 
     print(f"Parallel envs: {E}  |  robots/env: {N}  |  obs_dim: {obs_dim} "
-          f"({env.obs_dim} env + {GUIDE_DIM} guidance)  |  critic map: "
+          f"({env.obs_dim} env)  |  critic map: "
           f"{vec_env.critic_channels}x{vec_env.grid_h}x{vec_env.grid_w}"
           f" + {vec_env.critic_vec_dim}")
-    print(f"Coverable cells: {int(env.free_total)} / {env.num_cells} "
-          f"({env.free_total / env.num_cells:.1%} of the grid)")
+    print(f"Coverable cells: {int(env.free_totals[0])} / {env.num_cells} "
+          f"({env.free_totals[0] / env.num_cells:.1%} of the grid)")
     print(f"Guidance: BOSCO next-cell waypoint, arrival bonus {guide_bonus} "
           f"(alpha={env.alpha} per discovered cell)")
 
@@ -349,7 +332,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
         action_dim=action_dim,
         vec_dim=env.obs_vec_dim,
         n_rays=env.n_rays,
-        patch_dim=tail_dim,
+        tail_dim=tail_dim,
         lidar_embed=lidar_embed,
         hidden_size=hidden_size,
     )
@@ -361,7 +344,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     # `MAPPO.create_train_states` sizes its dummy observation from `vec_env`,
     # which knows nothing about the guidance block; the actor is initialised here
     # against the real width instead.
-    mappo.env = _WidenedEnv(vec_env, obs_dim)
+    mappo.env = vec_env
 
     T             = train_cfg.get('rollout_steps',  256)
     total_updates = train_cfg.get('total_updates',  3000)
@@ -406,10 +389,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
             'num_robots':       N,
             'obs_dim':          obs_dim,
             'action_dim':       action_dim,
-            'coverable_cells':  int(env.free_total),
+            'coverable_cells':  int(env.free_totals[0]),
             'steps_per_update': T * E,
             'guide_bonus':      guide_bonus,
-            'guide_dim':        GUIDE_DIM,
+            
         },
     )
     if run is not None:
@@ -600,7 +583,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     run.summary['best_update'] = update
 
     save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
-                    total_updates, actor_state, critic_state, carry.rms, GUIDE_DIM)
+                    total_updates, actor_state, critic_state, carry.rms)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms

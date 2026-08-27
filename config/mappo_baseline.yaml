@@ -1,9 +1,9 @@
 env:
   num_robots: 3
   num_humans: 0          # no dynamic obstacles in this baseline
-  k_teammates: 2         # how many closest teammates each robot observes
+  k_teammates: 0         # how many closest teammates each robot observes
   m_humans: 1            # observation slots for humans (zero-padded when 0 humans)
-  n_rays: 36             # lidar rays, one every 10 degrees
+  n_rays: 70             # lidar rays, one every 10 degrees
   max_lidar_range: 5.0   # metres
   cell_size: 0.5         # metres per grid cell → 24×16 = 384 cells for 12×8 m map
   sensing_radius: 5.0    # radius within which teammates / humans are visible

@@ -71,6 +71,7 @@ class Actor(nn.Module):
     action_dim: int = 2
     vec_dim: int = 8
     n_rays: int = 36
+    tail_dim: int = 0
     lidar_embed: int = 64
     hidden_size: int = 128
 
@@ -83,6 +84,7 @@ class Actor(nn.Module):
         """
         vec   = obs[:, : self.vec_dim]
         lidar = obs[:, self.vec_dim : self.vec_dim + self.n_rays]
+        tail  = obs[:, self.vec_dim + self.n_rays : self.vec_dim + self.n_rays + self.tail_dim]
 
         # A lidar scan is a ring, so circular padding keeps the two ends of the
         # array adjacent and makes the features rotation-equivariant.
@@ -91,7 +93,7 @@ class Actor(nn.Module):
         x = nn.relu(_conv(32, (3,), (2,), 'CIRCULAR')(x))
         x = nn.relu(_dense(self.lidar_embed, _RELU_GAIN)(x.reshape(x.shape[0], -1)))
 
-        h = jnp.concatenate([x, vec], axis=-1)
+        h = jnp.concatenate([x, vec, tail], axis=-1)
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
         h = nn.tanh(_dense(self.hidden_size, _RELU_GAIN)(h))
 
