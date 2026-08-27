@@ -24,11 +24,14 @@ elements>=3.19.1
 google-resumable-media>=2.7.2
 granular>=0.20.3
 ipdb
-jax
-jaxlib
+#jax
+#jaxlib
 jaxtyping
 ninjax>=3.5.1
 optax
 portal>=3.5.0
 scope>=0.4.4
 tqdm
+
+--find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+jax[cuda12]
