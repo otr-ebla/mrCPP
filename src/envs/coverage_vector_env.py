@@ -475,7 +475,7 @@ class MultiRobotCoverageEnv:
 
         step_count = state.step_count + 1
         truncated  = step_count >= self.max_steps
-        terminated = complete | jnp.any(robot_hit_human) | (jnp.any(collided) if self.terminate_on_collision
+        terminated = complete | (jnp.any(collided) if self.terminate_on_collision
                                  else jnp.bool_(False))
 
         next_state = state.replace(

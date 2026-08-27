@@ -307,8 +307,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
     
     if num_envs is not None:
         train_cfg['num_envs'] = num_envs
-    elif device.platform == 'gpu' and train_cfg.get('num_envs', 8) <= 16:
-        train_cfg['num_envs'] = 64
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
