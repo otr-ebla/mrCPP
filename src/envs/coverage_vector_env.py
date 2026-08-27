@@ -426,7 +426,7 @@ class MultiRobotCoverageEnv:
         human_terminated = jnp.any(human_collision) & terminate_on_human
         
         collided = (wall_hit | robot_hit | robot_hit_human) & alive
-        alive_next = alive & ~collided if self.terminate_on_collision else (alive & ~human_collision if terminate_on_human else alive)
+        alive_next = alive & ~collided if self.terminate_on_collision else jnp.where(terminate_on_human, alive & ~human_collision, alive)
 
         moved   = alive & ~collided
         new_pos = jnp.where(moved[:, None], next_pos, state.robot_positions)
