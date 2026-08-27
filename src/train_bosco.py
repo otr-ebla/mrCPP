@@ -308,7 +308,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
     if num_envs is not None:
         train_cfg['num_envs'] = num_envs
     elif device.platform == 'gpu' and train_cfg.get('num_envs', 8) <= 16:
-        train_cfg['num_envs'] = 1024
+        train_cfg['num_envs'] = 64
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
@@ -632,7 +632,7 @@ if __name__ == '__main__':
                         choices=['online', 'offline', 'disabled'],
                         help='W&B mode; "offline" logs locally with no network')
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
-    parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 1024 on GPU if config uses <=16)')
+    parser.add_argument('--envs', type=int, default=None, help='Number of parallel environments (overrides config, defaults to 64 on GPU if config uses <=16)')
     args = parser.parse_args()
     train(args.config, args.save_dir, args.resume,
           None if args.backend == 'auto' else args.backend,
