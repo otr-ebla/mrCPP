@@ -444,11 +444,12 @@ def run_episode(
         snap = _snapshot(env, state, view_state['show_lidar'])
 
         if bool(terminated) or bool(truncated):
-            # USA current_walls INVECE DI walls
             _draw_frame(surface, env, current_walls, current_free, snap, font,
                         ep_reward, view_state['show_lidar'], owner, palette,
                         controller.label, speed_label)
             pygame.display.flip()
+            if current_fps > 0:
+                clock.tick(current_fps)
             return ep_reward
 
 

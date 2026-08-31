@@ -10,18 +10,20 @@ class ProceduralMapLayout:
     Ensures a varied number of rooms, corridors, and doorways while keeping
     computational complexity low. 
     """
-    def __init__(self, width=12.0, height=8.0, min_room_size=3.0, max_walls=30,
+    def __init__(self, width=12.0, height=8.0, min_room_size=2.0, max_walls=30,
                  cell_size: float = 0.5, robot_radius: float = 0.20):
         self.width = width
         self.height = height
         self.min_room_size = min_room_size
         self.max_walls = max_walls
+        self.cell_size = cell_size
+        self.robot_radius = robot_radius
         
         self.outer_t = 0.20
         self.inner_t = 0.08
-        # Guarantee at least 2 coverable cells across every doorway,
-        # regardless of grid alignment.
-        self.door_size = 2 * cell_size + 2 * robot_radius
+        # Ensure door spans an integer number of cells (at least 2 cells = 1.0m)
+        self.door_cells = max(2, int(np.ceil((2 * cell_size + 2 * robot_radius) / cell_size)))
+        self.door_size = self.door_cells * self.cell_size
         
         self.walls = []
         self._generate_layout()
@@ -50,33 +52,113 @@ class ProceduralMapLayout:
         else:
             split_horizontally = random.choice([True, False])
 
+        min_cells = int(round(self.min_room_size / self.cell_size))
+
         if split_horizontally:
-            if h < self.min_room_size * 2:
+            h_cells = int(round(h / self.cell_size))
+            if h_cells < min_cells * 2:
                 return
-            split_y = y + random.uniform(self.min_room_size, h - self.min_room_size)
+            y_endpoints = []
+            for w_seg in self.walls:
+                if abs(w_seg[2] - w_seg[0]) < 0.2:
+                    cx = (w_seg[0] + w_seg[2]) / 2.0
+                    if abs(cx - x) < 0.2 or abs(cx - (x + w)) < 0.2:
+                        y_endpoints.append(int(round(w_seg[1] / self.cell_size)))
+                        y_endpoints.append(int(round(w_seg[3] / self.cell_size)))
             
-            # Wall segments with a door gap
-            door_pos = x + random.uniform(0.5, w - self.door_size - 0.5)
-            self.walls.append([x, split_y - self.inner_t / 2, door_pos, split_y + self.inner_t / 2])
-            self.walls.append([door_pos + self.door_size, split_y - self.inner_t / 2, x + w, split_y + self.inner_t / 2])
+            valid_split_cells_y = []
+            y_start_cell = int(round(y / self.cell_size))
+            for split_cell_y_local in range(min_cells, h_cells - min_cells + 1):
+                split_cell_y_global = y_start_cell + split_cell_y_local
+                valid = True
+                for y_ep in y_endpoints:
+                    if abs(split_cell_y_global - y_ep) == 1:
+                        valid = False
+                        break
+                if valid:
+                    valid_split_cells_y.append(split_cell_y_local)
             
-            # Recurse into the two new sub-regions
-            self._split_space(x, y, w, split_y - y, depth + 1, max_depth)
-            self._split_space(x, split_y, w, y + h - split_y, depth + 1, max_depth)
+            if not valid_split_cells_y:
+                return
+                
+            split_cell_y = random.choice(valid_split_cells_y)
+            split_y = y + split_cell_y * self.cell_size
+            
+            w_cells = int(round(w / self.cell_size))
+            valid_door_cells = []
+            for dc in range(w_cells - self.door_cells + 1):
+                w1 = dc
+                w2 = w_cells - dc - self.door_cells
+                if (w1 == 0 or w1 >= 2) and (w2 == 0 or w2 >= 2):
+                    valid_door_cells.append(dc)
+            
+            if not valid_door_cells:
+                return
+            
+            door_cell = random.choice(valid_door_cells)
+            door_pos = x + door_cell * self.cell_size
+            
+            if door_pos > x:
+                self.walls.append([x, split_y - self.inner_t / 2, door_pos, split_y + self.inner_t / 2])
+            if (x + w) > (door_pos + self.door_size):
+                self.walls.append([door_pos + self.door_size, split_y - self.inner_t / 2, x + w, split_y + self.inner_t / 2])
+            
+            # Recurse into the two new sub-regions with exact grid-aligned dimensions
+            self._split_space(x, y, w, split_cell_y * self.cell_size, depth + 1, max_depth)
+            self._split_space(x, split_y, w, (h_cells - split_cell_y) * self.cell_size, depth + 1, max_depth)
             
         else:
-            if w < self.min_room_size * 2:
+            w_cells = int(round(w / self.cell_size))
+            if w_cells < min_cells * 2:
                 return
-            split_x = x + random.uniform(self.min_room_size, w - self.min_room_size)
+            x_endpoints = []
+            for w_seg in self.walls:
+                if abs(w_seg[3] - w_seg[1]) < 0.2:
+                    cy = (w_seg[1] + w_seg[3]) / 2.0
+                    if abs(cy - y) < 0.2 or abs(cy - (y + h)) < 0.2:
+                        x_endpoints.append(int(round(w_seg[0] / self.cell_size)))
+                        x_endpoints.append(int(round(w_seg[2] / self.cell_size)))
             
-            # Wall segments with a door gap
-            door_pos = y + random.uniform(0.5, h - self.door_size - 0.5)
-            self.walls.append([split_x - self.inner_t / 2, y, split_x + self.inner_t / 2, door_pos])
-            self.walls.append([split_x - self.inner_t / 2, door_pos + self.door_size, split_x + self.inner_t / 2, y + h])
+            valid_split_cells_x = []
+            x_start_cell = int(round(x / self.cell_size))
+            for split_cell_x_local in range(min_cells, w_cells - min_cells + 1):
+                split_cell_x_global = x_start_cell + split_cell_x_local
+                valid = True
+                for x_ep in x_endpoints:
+                    if abs(split_cell_x_global - x_ep) == 1:
+                        valid = False
+                        break
+                if valid:
+                    valid_split_cells_x.append(split_cell_x_local)
             
-            # Recurse into the two new sub-regions
-            self._split_space(x, y, split_x - x, h, depth + 1, max_depth)
-            self._split_space(split_x, y, w - (split_x - x), h, depth + 1, max_depth)
+            if not valid_split_cells_x:
+                return
+                
+            split_cell_x = random.choice(valid_split_cells_x)
+            split_x = x + split_cell_x * self.cell_size
+            
+            h_cells = int(round(h / self.cell_size))
+            valid_door_cells = []
+            for dc in range(h_cells - self.door_cells + 1):
+                w1 = dc
+                w2 = h_cells - dc - self.door_cells
+                if (w1 == 0 or w1 >= 2) and (w2 == 0 or w2 >= 2):
+                    valid_door_cells.append(dc)
+            
+            if not valid_door_cells:
+                return
+                
+            door_cell = random.choice(valid_door_cells)
+            door_pos = y + door_cell * self.cell_size
+            
+            if door_pos > y:
+                self.walls.append([split_x - self.inner_t / 2, y, split_x + self.inner_t / 2, door_pos])
+            if (y + h) > (door_pos + self.door_size):
+                self.walls.append([split_x - self.inner_t / 2, door_pos + self.door_size, split_x + self.inner_t / 2, y + h])
+            
+            # Recurse into the two new sub-regions with exact grid-aligned dimensions
+            self._split_space(x, y, split_cell_x * self.cell_size, h, depth + 1, max_depth)
+            self._split_space(split_x, y, (w_cells - split_cell_x) * self.cell_size, h, depth + 1, max_depth)
 
     def _pad_walls(self):
         """
