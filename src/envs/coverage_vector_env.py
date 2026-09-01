@@ -39,6 +39,7 @@ class EnvState:
     key:              jax.Array   # PRNG key carried for auto-reset
     wall_hits:        jax.Array   # (N,)     float32  — 0.0 / 1.0
     robot_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
+    human_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
     human_stop_prob:  jax.Array   # ()       float32
 
 
@@ -367,6 +368,7 @@ class MultiRobotCoverageEnv:
             key              = key,
             wall_hits        = jnp.zeros((self.num_robots,), jnp.float32),
             robot_hits       = jnp.zeros((self.num_robots,), jnp.float32),
+            human_hits       = jnp.zeros((self.num_robots,), jnp.float32),
             human_stop_prob  = jnp.float32(0.0),
         )
 
@@ -503,6 +505,7 @@ class MultiRobotCoverageEnv:
             key              = key,
             wall_hits        = wall_hit.astype(jnp.float32),
             robot_hits       = robot_hit.astype(jnp.float32),
+            human_hits       = robot_hit_human.astype(jnp.float32),
         )
         return next_state, rewards, terminated, truncated
 
@@ -610,6 +613,7 @@ class MultiRobotCoverageEnv:
             'num_robots_alive':     jnp.sum(state.robot_alive),
             'wall_collision_rate':  jnp.mean(state.wall_hits),
             'robot_collision_rate': jnp.mean(state.robot_hits),
+            'human_collision_rate': jnp.mean(state.human_hits),
             'complete':             (covered >= free_total - 0.5).astype(jnp.float32),
             'timeout':              (state.step_count >= self.max_steps).astype(jnp.float32),
         }

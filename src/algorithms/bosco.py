@@ -41,8 +41,9 @@ Pipeline
      * line-of-sight shortcutting — aim at the farthest tour node still reachable
        in a straight, wall-free line *whose segment still crosses every skipped
        cell*, so smoothing never sacrifices coverage;
-     * priority yielding — on a near encounter the higher-id robot stops, which
-       removes the collision penalty without any negotiation protocol;
+     * priority yielding plus a one-step kinematic safety shield — on a near
+       encounter the higher-id robot yields, then predicted overlapping commands
+       are stopped before they reach the environment;
      * stuck recovery + mop-up — a robot that stops making progress pulls clear of
        any teammate it is wedged against, replans, and spins if it keeps failing;
        a robot whose tour is finished walks to the nearest cell still uncovered
@@ -55,11 +56,10 @@ Pipeline
        through recovery whatever its plan believes it is doing.
 
 Measured on the default 12x8 m indoor map (384 coverable cells, 3 robots):
-100% coverage on every episode, ~1600 steps to finish, ~16 soft collisions per
-episode, and no robot ever stationary for more than the ~25 steps a deliberate
-yield costs. The step count is dominated by turning: at omega_max = 1 rad/s a 90°
-lane change costs 16 steps, and roughly half of all steps are spent turning in
-place.
+100% coverage on every episode, ~1600 steps to finish, and no robot ever
+stationary for more than the recovery budget. The step count is dominated by
+turning: at omega_max = 1 rad/s a 90° lane change costs 16 steps, and roughly
+half of all steps are spent turning in place.
 
 Usage
 -----
@@ -810,12 +810,14 @@ class BoscoExpert:
                  yield_radius_factor: float = 4.0, yield_limit: int = 25,
                  stuck_limit: int = 6, spin_steps: int = 8, fail_limit: int = 3,
                  revisit_penalty: float = REVISIT_PENALTY, skip_horizon: int = 4,
-                 idle_limit: int = 80):
+                 idle_limit: int = 80, collision_margin: float = 0.02):
         self.env = env
         self.n = env.num_robots
         self.dt = env.dt
         self.v_max = env.v_max
         self.omega_max = env.omega_max
+        self.robot_radius = float(env.robot_radius)
+        self.collision_margin = float(collision_margin)
 
         self.graph = TraversabilityGraph(env, map_id=map_id)
         self.lookahead = int(lookahead)
@@ -1086,6 +1088,13 @@ class BoscoExpert:
         v = np.where(stop, 0.0, v)
         omega = np.where(stop, 0.0, omega)
 
+        # Yielding handles ordinary encounters early, but an ID-priority rule
+        # alone cannot make the final command safe: the lower-ID robot may still
+        # drive directly into the higher-ID robot that stopped for it. Simulate
+        # the actual next kinematic step and suppress translation before either
+        # disc can overlap.
+        v = self._collision_shield(pos, hdg, v, omega)
+
         self.prev_v = v.astype(np.float32)
         actions = np.stack([
             2.0 * v / self.v_max - 1.0,                      # v -> [-1, 1]
@@ -1094,6 +1103,61 @@ class BoscoExpert:
         return actions.astype(np.float32)
 
     # -- helpers ------------------------------------------------------------
+
+    def _predict_positions(self, positions: np.ndarray, headings: np.ndarray,
+                           v: np.ndarray, omega: np.ndarray) -> np.ndarray:
+        """Mirror the environment's differential-drive position update."""
+        straight = np.abs(omega) < 1e-6
+        omega_safe = np.where(straight, 1.0, omega)
+        turn_heading = headings + omega * self.dt
+        radius = v / omega_safe
+        pos_straight = positions + np.stack([
+            v * np.cos(headings), v * np.sin(headings)
+        ], axis=-1) * self.dt
+        pos_turn = positions + radius[:, None] * np.stack([
+            np.sin(turn_heading) - np.sin(headings),
+            np.cos(headings) - np.cos(turn_heading),
+        ], axis=-1)
+        return np.where(straight[:, None], pos_straight, pos_turn)
+
+    def _collision_shield(self, positions: np.ndarray, headings: np.ndarray,
+                          v: np.ndarray, omega: np.ndarray) -> np.ndarray:
+        """Stop unsafe translations before the environment rejects the move."""
+        safe_v = np.asarray(v, dtype=np.float32).copy()
+        min_dist = 2.0 * self.robot_radius + self.collision_margin
+
+        # Stopping one robot can expose a conflict with a third robot that had
+        # expected it to move away, so recompute candidates until no new stop is
+        # needed. At least one velocity becomes zero on every non-final pass.
+        for _ in range(self.n):
+            candidate = self._predict_positions(positions, headings, safe_v, omega)
+            changed = False
+            for i in range(self.n):
+                for j in range(i + 1, self.n):
+                    moving_i = safe_v[i] > 1e-6
+                    moving_j = safe_v[j] > 1e-6
+                    if not (moving_i or moving_j):
+                        continue
+                    if np.linalg.norm(candidate[i] - candidate[j]) >= min_dist:
+                        continue
+
+                    stop_i_safe = np.linalg.norm(positions[i] - candidate[j]) >= min_dist
+                    stop_j_safe = np.linalg.norm(candidate[i] - positions[j]) >= min_dist
+                    if stop_i_safe and stop_j_safe:
+                        # Preserve BOSCO's deterministic ID priority when either
+                        # robot can safely yield.
+                        safe_v[j] = 0.0
+                    elif stop_i_safe:
+                        safe_v[i] = 0.0
+                    elif stop_j_safe:
+                        safe_v[j] = 0.0
+                    else:
+                        safe_v[i] = 0.0
+                        safe_v[j] = 0.0
+                    changed = True
+            if not changed:
+                break
+        return safe_v
 
     def _retire_reached(self, r: int, p: np.ndarray) -> int:
         """Retire every tour node the robot is already standing on. Returns the cursor.

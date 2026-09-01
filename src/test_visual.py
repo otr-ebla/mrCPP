@@ -47,6 +47,7 @@ SCALE      = 80   # pixels per metre
 MARGIN     = 40   # pixel border around the map
 HUD_HEIGHT = 50   # pixels for the stats bar at the bottom
 FPS        = 30
+POPUP_DURATION_MS = 1300
 
 # Speed levels (FPS) cycled by pressing 'S' during playback.
 # Each step doubles the previous; the first entry is the default speed.
@@ -76,6 +77,12 @@ COLORS = {
     'dead':      (120, 120, 120),
     'hud_bg':    ( 25,  25,  25),
     'hud_text':  (230, 230, 230),
+    'success':   ( 35, 190,  80),
+    'rr_hit':    (235,  45,  60),
+    'rw_hit':    (155,  25,  35),
+    'rh_hit':    (190,  90,  20),
+    'timeout':   (210,  35, 180),
+    'popup_bg':  ( 22,  22,  22),
 }
 
 
@@ -125,10 +132,16 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         info['coverage_ratio'],
         info['covered_cells'],
         info['total_cells'],
+        info['timeout'],
+        state.wall_hits,
+        state.robot_hits,
+        state.human_hits,
         env._cast_lidar_all(state)
         if want_lidar else jnp.zeros((0,), jnp.float32),
     )
-    pos, hdg, human_pos, human_hdg, grid, alive, step, cov_ratio, covered, total, lidar = jax.device_get(payload)
+    (pos, hdg, human_pos, human_hdg, grid, alive, step, cov_ratio,
+     covered, total, timeout, wall_hits, robot_hits, human_hits,
+     lidar) = jax.device_get(payload)
     return {
         'positions':      np.asarray(pos),
         'headings':       np.asarray(hdg),
@@ -140,8 +153,43 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         'coverage_ratio': float(cov_ratio),
         'covered_cells':  int(covered),
         'total_cells':    int(total),
+        'timeout':        bool(timeout),
+        'wall_hits':      np.asarray(wall_hits),
+        'robot_hits':     np.asarray(robot_hits),
+        'human_hits':     np.asarray(human_hits),
         'lidar':          np.asarray(lidar),
     }
+
+
+def _episode_outcome(snap: dict) -> tuple[str, tuple[int, int, int]] | None:
+    """Return the terminal banner, with collisions taking priority over success."""
+    if np.any(np.asarray(snap['robot_hits']) > 0.0):
+        return 'RR-COLLISION', COLORS['rr_hit']
+    if np.any(np.asarray(snap['wall_hits']) > 0.0):
+        return 'RW-COLLISION', COLORS['rw_hit']
+    if np.any(np.asarray(snap['human_hits']) > 0.0):
+        return 'RH-COLLISION', COLORS['rh_hit']
+    if snap['covered_cells'] >= snap['total_cells']:
+        return 'SUCCESS', COLORS['success']
+    if snap['timeout']:
+        return 'TIMEOUT', COLORS['timeout']
+    return None
+
+
+def _draw_popup(surface: pygame.Surface, popup: dict | None,
+                font: pygame.font.Font) -> None:
+    if popup is None:
+        return
+    label = font.render(popup['label'], True, popup['color'])
+    box = label.get_rect()
+    box.inflate_ip(48, 28)
+    box.center = (surface.get_width() // 2,
+                  (surface.get_height() - HUD_HEIGHT) // 2)
+    shadow = box.move(5, 5)
+    pygame.draw.rect(surface, (0, 0, 0), shadow, border_radius=12)
+    pygame.draw.rect(surface, COLORS['popup_bg'], box, border_radius=12)
+    pygame.draw.rect(surface, popup['color'], box, width=4, border_radius=12)
+    surface.blit(label, label.get_rect(center=box.center))
 
 
 def _draw_frame(
@@ -157,6 +205,8 @@ def _draw_frame(
     palette: np.ndarray | None = None,
     label: str = '',
     speed_label: str = '1×',
+    popup: dict | None = None,
+    popup_font: pygame.font.Font | None = None,
 ) -> None:
     mw = env.grid_w * env.cell_size
     mh = env.grid_h * env.cell_size
@@ -301,6 +351,8 @@ def _draw_frame(
             surface.blit(chunk, (x, top + line_h))
             x += chunk.get_width()
 
+    _draw_popup(surface, popup, popup_font or font)
+
 
 class MappoController:
     """Trained policy. One jitted call per frame: normalise → act → step.
@@ -383,6 +435,7 @@ def run_episode(
     surface: pygame.Surface,
     clock: pygame.time.Clock,
     font: pygame.font.Font,
+    popup_font: pygame.font.Font,
     palette: np.ndarray,
     fps: int,
     view_state: dict,
@@ -426,11 +479,15 @@ def run_episode(
             speed_label = 'PAUSED'
 
         owner = controller.owner if view_state['show_owner'] else None
+        popup = view_state.get('popup')
+        if popup is not None and pygame.time.get_ticks() >= popup['until_ms']:
+            popup = None
+            view_state['popup'] = None
         
         # USA current_walls INVECE DI walls
         _draw_frame(surface, env, current_walls, current_free, snap, font,
                     ep_reward, view_state['show_lidar'], owner, palette,
-                    controller.label, speed_label)
+                    controller.label, speed_label, popup, popup_font)
         pygame.display.flip()
         
         if view_state.get('paused', False):
@@ -444,9 +501,18 @@ def run_episode(
         snap = _snapshot(env, state, view_state['show_lidar'])
 
         if bool(terminated) or bool(truncated):
+            outcome = _episode_outcome(snap)
+            if outcome is not None:
+                label, color = outcome
+                view_state['popup'] = {
+                    'label': label,
+                    'color': color,
+                    'until_ms': pygame.time.get_ticks() + POPUP_DURATION_MS,
+                }
             _draw_frame(surface, env, current_walls, current_free, snap, font,
                         ep_reward, view_state['show_lidar'], owner, palette,
-                        controller.label, speed_label)
+                        controller.label, speed_label, view_state.get('popup'),
+                        popup_font)
             pygame.display.flip()
             if current_fps > 0:
                 clock.tick(current_fps)
@@ -572,11 +638,12 @@ def main() -> None:
     pygame.display.set_caption(f'{controller.label.strip()} Coverage — Visual Test')
     clock = pygame.time.Clock()
     font  = pygame.font.SysFont('monospace', 15)
+    popup_font = pygame.font.SysFont('monospace', 34, bold=True)
 
     palette = _ownership_palette(env.num_robots)
     # The overlay only has something to say once a partition exists.
     view_state = {'show_lidar': False, 'show_owner': True,
-                  'speed_idx': 0}
+                  'speed_idx': 0, 'popup': None}
     key = jax.random.PRNGKey(args.seed)
 
     ep_num = 0
@@ -585,7 +652,7 @@ def main() -> None:
             key, ep_key = jax.random.split(key)
             print(f"Episode {ep_num + 1} ...", end='', flush=True)
             ret = run_episode(env, controller, ep_key, surface, clock, font,
-                               palette, args.fps, view_state)
+                               popup_font, palette, args.fps, view_state)
             if ret is None:
                 print("  (quit)")
                 break
