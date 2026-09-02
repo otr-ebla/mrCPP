@@ -75,14 +75,25 @@ class MultiRobotCoverageEnv:
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
 
         # -- Reward weights --
-        self.alpha = float(cfg.get('alpha', 10.0))
-        self.bosco_gamma = float(cfg.get('bosco_gamma', 1.0))
-        self.beta  = float(cfg.get('beta',   0.005))
-        self.kappa = float(cfg.get('kappa', 20.0))
-        self.tau   = float(cfg.get('tau',    0.05))
-        if self.beta >= self.tau:
-            raise ValueError("beta must be strictly smaller than tau")
-        self.psi        = float(cfg.get('psi',              1.5))
+        self.alpha       = float(cfg.get('alpha',       10.0))
+        self.bosco_gamma = float(cfg.get('bosco_gamma',  5.0))
+        self.beta        = float(cfg.get('beta',         0.5))
+        self.kappa       = float(cfg.get('kappa',        5.0))
+        self.tau         = float(cfg.get('tau',          0.05))
+        self.psi         = float(cfg.get('psi',          2.0))
+        weights = {
+            'alpha': self.alpha,
+            'bosco_gamma': self.bosco_gamma,
+            'beta': self.beta,
+            'kappa': self.kappa,
+            'tau': self.tau,
+            'psi': self.psi,
+        }
+        negative = [name for name, value in weights.items() if value < 0.0]
+        if negative:
+            raise ValueError(
+                f"reward weights must be non-negative: {', '.join(negative)}"
+            )
         self._safe_dist = float(cfg.get('safe_dist_factor', 5.0)) * self.robot_radius
         self.room_completion_bonus     = float(cfg.get('room_completion_bonus',     50.0))
         self.room_completion_threshold = float(cfg.get('room_completion_threshold', 0.85))

@@ -27,18 +27,12 @@ is learnable rather than noise. It is also the only channel that carries global
 information — the tour is planned on the whole map — into an otherwise strictly
 local, decentralised observation.
 
-Cost: the rollout is a python loop
-----------------------------------
-`train_simple` collects a whole update inside one `lax.scan`. That is impossible
-here: BOSCO is a host-side numpy planner (heap Dijkstra, python tours), so the
-waypoint is produced between two device calls and the scan degrades into a
-python loop. Everything that can stay on device still does — the actor, the
-critic and the entire vectorised environment transition are one jitted call each
-— and the host bookkeeping is gated on a robot actually changing cell (~5 steps
-at v_max against a 0.5 m cell), so most steps cost only the device→host transfer
-of poses and the coverage grid. Measured at 8 envs x 3 robots on CPU that is
-~2.6x `train_simple`'s wall clock per update. The PPO update itself is untouched
-and still runs as a single jitted scan.
+Accelerator execution
+---------------------
+The initial BOSCO sweep is built once on the host. Tours, cursors, dynamic
+re-routing, environment transitions, actor and critic then remain inside one
+compiled `lax.scan`; episode resets only reset device-side cursor state. PPO is
+also a compiled scan, so there is no Python or NumPy work in either hot loop.
 
 Usage
 -----
@@ -172,6 +166,10 @@ class GuidedRollout:
         self.guides = guides
         self.graph = guides[0].graph
         self.bonus = float(guide_bonus)
+        self.graph_neighbors = jnp.asarray(self.graph.neighbors, jnp.int32)
+        self.graph_free = jnp.asarray(self.graph.free, jnp.bool_)
+        self.graph_components = jnp.asarray(self.graph.component, jnp.int32)
+        self.graph_centers = jnp.asarray(self.graph.centers, jnp.float32)
         e, n = vec_env.E, vec_env.num_robots
 
         @jax.jit
@@ -191,8 +189,6 @@ class GuidedRollout:
         self._act = act
         self._value_fn = jax.jit(mappo._values)
         
-        # JIT the entire T-step scan!
-        @jax.jit
         def jitted_run(actor_params, critic_params, carry, keys):
             def scan_step(c, k):
                 state, obs, gstate, rms, guide_state = c
@@ -202,24 +198,22 @@ class GuidedRollout:
                 )
                 next_state, _, reward, term, done, info, _ = vec_env.step(state, action)
                 
-                import jax.numpy as jnp
-                from src.algorithms.jax_bosco import jax_guide_step
-                
                 new_guide_state, waypoint, reached = jax_guide_step(
                     guide_state,
                     next_state.robot_positions,
                     next_state.coverage_grid,
                     done,
-                    jnp.asarray(self.graph.neighbors, jnp.int32),
+                    self.graph_neighbors,
                     vec_env.grid_w,
                     vec_env.grid_h,
                     vec_env.env.cell_size,
-                    self.guides
+                    free_cells=self.graph_free,
+                    graph_components=self.graph_components,
                 )
                 
                 valid = waypoint >= 0
                 safe_targets = jnp.maximum(waypoint, 0)
-                coords = jnp.asarray(self.graph.centers)[safe_targets]
+                coords = self.graph_centers[safe_targets]
                 target_coords = jnp.where(valid[..., None], coords, next_state.robot_positions)
                 
                 next_state, next_obs, next_gstate = vec_env.update_bosco(next_state, target_coords)
@@ -246,7 +240,7 @@ class GuidedRollout:
                 
             return jax.lax.scan(scan_step, carry, keys)
 
-        self._jitted_run = jitted_run
+        self._jitted_run = jax.jit(jitted_run)
 
     @staticmethod
     def _host(state, done=None):
@@ -267,7 +261,7 @@ class GuidedRollout:
             self.guides[e].reset(pos[e])
             for r in range(N):
                 tour = self.guides[e].tours[r]
-                t_len = len(tour)
+                t_len = min(len(tour), MAX_TOUR_LEN)
                 tour_lens[e, r] = t_len
                 tours[e, r, :t_len] = tour[:MAX_TOUR_LEN]
             targets[e], _ = self.guides[e].update(pos[e], cov[e])
@@ -491,14 +485,14 @@ def train(config_path: str, save_dir: str, resume: str | None,
         # hiding it from the logged return would make the reward curve describe a
         # different objective than the one being maximised. `guide_hits` reports
         # the shaping separately, and `mean_ep_coverage` stays the success metric.
-        team_rewards = np.asarray(jnp.mean(traj.reward, axis=-1)) / reward_scale
-        dones     = np.asarray(traj.done)          # (T, E)
-        coverage  = np.asarray(traj.coverage)      # (T, E)
-        wall_hit  = np.asarray(traj.wall_hit)      # (T, E)
-        robot_hit = np.asarray(traj.robot_hit)
-        complete  = np.asarray(traj.complete)
-        timeout   = np.asarray(traj.timeout)
-        hit_rate_t = np.asarray(hits).mean(axis=2)             # (T, E) team-mean per step
+        host_stats = jax.device_get((
+            jnp.mean(traj.reward, axis=-1), traj.done, traj.coverage,
+            traj.wall_hit, traj.robot_hit, traj.complete, traj.timeout, hits,
+        ))
+        (team_rewards, dones, coverage, wall_hit, robot_hit,
+         complete, timeout, host_hits) = map(np.asarray, host_stats)
+        team_rewards /= reward_scale
+        hit_rate_t = host_hits.mean(axis=2)          # (T, E) team-mean per step
         for t in range(T):
             ep_reward += team_rewards[t]
             ep_len    += 1
@@ -540,7 +534,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
             # lane change costs ~16 steps of turning in place, which buys no
             # waypoint. That measured 0.095, not the ceiling, is what a policy
             # tracking the tour as well as the planner does looks like.
-            guide_rate = float(hits.mean())
+            guide_rate = float(host_hits.mean())
             outcomes = np.asarray(ep_outcomes[-_WINDOW:], dtype=np.int64)
             if outcomes.size:
                 completion_rate    = float(np.mean(outcomes == _SUCCESS))

@@ -1,6 +1,8 @@
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
-from typing import NamedTuple
+
 
 class JaxGuideState(NamedTuple):
     target: jax.Array        # (E, N)
@@ -114,210 +116,105 @@ def get_next_waypoint(cell, target_dists, cost, neighbors, n_cells):
     return best_neighbor
 
 
+def select_mopup_targets(cell, covered, free_cells, components, w):
+    """Choose one reachable uncovered goal per robot after its tour ends.
+
+    Pending cells are split by current Manhattan distance so robots that finish
+    at the same time do not all converge on the same hole.  Connectivity is
+    checked with the graph's static component labels; the weighted distance
+    field below still decides the actual route and prices revisits.
+    """
+    E, N = cell.shape
+    C = covered.shape[-1]
+
+    ids = jnp.arange(C, dtype=jnp.int32)
+    cell_row, cell_col = cell // w, cell % w
+    rows, cols = ids // w, ids % w
+    distance = (
+        jnp.abs(cell_row[..., None] - rows)
+        + jnp.abs(cell_col[..., None] - cols)
+    ).astype(jnp.float32)
+
+    component = components[cell]
+    reachable = components[None, None, :] == component[..., None]
+    pending = free_cells[None, None, :] & ~covered[:, None, :] & reachable
+
+    robot_for_cell = jnp.argmin(jnp.where(pending, distance, jnp.inf), axis=1)
+    assigned = robot_for_cell[:, None, :] == jnp.arange(N)[None, :, None]
+    assigned_pending = pending & assigned
+
+    # A robot may own no pending cell in the dynamic split.  Let it help with
+    # any reachable remainder instead of idling; duplicate goals are preferable
+    # to abandoning coverable ground.
+    candidates = jnp.where(
+        jnp.any(assigned_pending, axis=-1, keepdims=True),
+        assigned_pending,
+        pending,
+    )
+    score = jnp.where(candidates, distance, jnp.inf)
+    target = jnp.argmin(score, axis=-1)
+    return jnp.where(jnp.isfinite(jnp.min(score, axis=-1)), target, -1)
+
+
 def advance_cursors(tours, tour_lens, idx, cell, covered, snap_window=8):
-    """
-    Advances the cursor for all robots.
-    tours: (E, N, MAX_TOUR_LEN)
-    tour_lens: (E, N)
-    idx: (E, N)
-    cell: (E, N)
-    covered: (E, C)
-    """
-    E, N = idx.shape
-    
-    def advance_single(t, t_len, i, c, cov):
-        # t: (MAX_TOUR_LEN,), t_len: int, i: int, c: int, cov: (C,)
-        
-        # 1. Snap window
-        def snap_body(val):
-            k, best_k = val
-            is_match = (k < t_len) & (t[k] == c)
-            new_best = jnp.where(is_match, k + 1, best_k)
-            return (k + 1, new_best)
-            
-        _, i = jax.lax.while_loop(
-            lambda val: val[0] < i + snap_window,
-            snap_body,
-            (i, i)
-        )
-        
-        # Forward past current cell
-        i = jax.lax.while_loop(
-            lambda k: (k < t_len) & (t[k] == c),
-            lambda k: k + 1,
-            i
-        )
-        
-        # 2. Skip covered cells
-        i = jax.lax.while_loop(
-            lambda k: (k < t_len) & cov[t[k]],
-            lambda k: k + 1,
-            i
-        )
-        
-        # Forward past current cell again if needed
-        i = jax.lax.while_loop(
-            lambda k: (k < t_len) & (t[k] == c),
-            lambda k: k + 1,
-            i
-        )
-        
-        return i
+    """Advance every ``(environment, robot)`` cursor in parallel."""
+    tour_capacity = tours.shape[-1]
+    offsets = jnp.arange(snap_window, dtype=idx.dtype)
+    candidates = idx[..., None] + offsets
+    in_tour = (candidates < tour_lens[..., None]) & (candidates < tour_capacity)
+    safe_candidates = jnp.clip(candidates, 0, tour_capacity - 1)
+    candidate_cells = jnp.take_along_axis(tours, safe_candidates, axis=-1)
+    matches = in_tour & (candidate_cells == cell[..., None])
+    idx = jnp.max(jnp.where(matches, candidates + 1, idx[..., None]), axis=-1)
 
-    # Vectorize advance_single
-    v_advance = jax.vmap(jax.vmap(advance_single, in_axes=(0, 0, 0, 0, 0)), in_axes=(0, 0, 0, 0, 0))
-    # Wait, cov is (E, C), so in_axes for cov is (0) for the outer vmap, and (None) for the inner!
-    v_advance = jax.vmap(
-        jax.vmap(advance_single, in_axes=(0, 0, 0, 0, None)), 
-        in_axes=(0, 0, 0, 0, 0)
+    def tour_cells(cursor):
+        safe = jnp.clip(cursor, 0, tour_capacity - 1)
+        return jnp.take_along_axis(tours, safe[..., None], axis=-1)[..., 0]
+
+    def skip_while(cursor, predicate):
+        def active(c):
+            return (c < tour_lens) & predicate(tour_cells(c))
+
+        return jax.lax.while_loop(
+            lambda c: jnp.any(active(c)),
+            lambda c: jnp.where(active(c), c + 1, c),
+            cursor,
+        )
+
+    idx = skip_while(idx, lambda tour_cell: tour_cell == cell)
+    env_ids = jnp.arange(covered.shape[0], dtype=jnp.int32)[:, None]
+    idx = skip_while(
+        idx,
+        lambda tour_cell: covered[env_ids, jnp.maximum(tour_cell, 0)],
     )
-    
-    new_idx = v_advance(tours, tour_lens, idx, cell, covered)
-    return new_idx
+    return skip_while(idx, lambda tour_cell: tour_cell == cell)
 
 
-def jax_guide_update(state: JaxGuideState, positions, coverage_grid, graph_neighbors, n_cells, cell_size, revisit_penalty=0.5):
+def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done,
+                   graph_neighbors, w, h, cell_size, guides=None,
+                   free_cells=None, graph_components=None, revisit_penalty=0.5):
+    """Advance the fixed sweep and emit a reactive one-cell waypoint.
+
+    The remaining sweep is retained after a deviation, while its shortest-path
+    prefix is recomputed from the robot's actual cell.  Once that sweep is
+    exhausted, a dynamic nearest-cell split keeps every robot mopping up
+    reachable uncovered ground until coverage is complete.
     """
-    positions: (E, N, 2)
-    coverage_grid: (E, H, W)
-    """
-    E, N = state.idx.shape
-    C = n_cells
-    
-    # Calculate cell from pos
-    # Wait, graph.cell_of does:
-    # c = clip(pos[:, 0] / cell_size) ...
-    # We'll assume the caller passes the cell indices directly to keep it clean.
-    pass
-
-def jax_guide_update(state: JaxGuideState, positions, coverage_grid, graph_neighbors, w, h, cell_size, revisit_penalty=0.5):
+    del guides  # Backward-compatible keyword; no host objects enter the hot path.
     E, N = state.idx.shape
     C = w * h
-    
-    # 1. cell_of
-    col = jnp.clip((positions[..., 0] / cell_size).astype(jnp.int32), 0, w - 1)
-    row = jnp.clip((positions[..., 1] / cell_size).astype(jnp.int32), 0, h - 1)
-    cell = row * w + col # (E, N)
-    
-    covered = (coverage_grid > 0.5).reshape(E, C)
-    
-    reached = (state.target >= 0) & (cell == state.target)
-    
-    # 2. Advance index for all robots (even if they didn't change cell, to be safe, or we can condition it)
-    new_idx = advance_cursors(state.tours, state.tour_lens, state.idx, cell, covered)
-    
-    # Extract new target cell from tour
-    # If new_idx >= tour_lens, target is -1 (needs replan)
-    # We will use pure_callback for replan later, but for now just output -1
-    is_finished = new_idx >= state.tour_lens
-    
-    # Gather target from tours
-    e_idx = jnp.arange(E)[:, None]
-    n_idx = jnp.arange(N)[None, :]
-    
-    # Safe index
-    safe_idx = jnp.minimum(new_idx, state.tour_lens - 1)
-    tour_target = state.tours[e_idx, n_idx, safe_idx]
-    
-    tour_target = jnp.where(is_finished, -1, tour_target)
-    
-    # 3. Pathfinding (Bellman-Ford) from tour_target to all cells
-    cost = jnp.where(covered, 1.0 + revisit_penalty, 1.0)
-    
-    # We run Bellman-Ford for targets >= 0
-    dist = jax_bellman_ford_to_target(tour_target, cost, graph_neighbors, C)
-    
-    # 4. Find the next waypoint from current cell
-    waypoint = get_next_waypoint(cell, dist, cost, graph_neighbors, C)
-    
-    # If finished or unreachable, keep -1
-    waypoint = jnp.where(is_finished, -1, waypoint)
-    
-    new_state = state._replace(
-        target=waypoint,
-        prev_cell=cell,
-        idx=new_idx
-    )
-    
-    return new_state, waypoint, reached
 
-import numpy as np
-
-def reset_guides_callback(done, pos, current_tours, current_tour_lens, guides):
-    """
-    done: (E,) bool
-    pos: (E, N, 2)
-    guides: list of BoscoGuide objects
-    """
-    done = np.asarray(done)
-    pos = np.asarray(pos)
-    
-    new_tours = np.copy(current_tours)
-    new_tour_lens = np.copy(current_tour_lens)
-    
-    for e in range(len(done)):
-        if done[e]:
-            guides[e].reset(pos[e])
-            
-            for r in range(pos.shape[1]):
-                tour = guides[e].tours[r]
-                t_len = len(tour)
-                new_tour_lens[e, r] = t_len
-                # pad tour
-                padded = np.full(current_tours.shape[2], -1, dtype=np.int32)
-                padded[:t_len] = tour[:current_tours.shape[2]]
-                new_tours[e, r] = padded
-                
-    return new_tours, new_tour_lens
-
-def jax_reset_guides(done, pos, tours, tour_lens, guides):
-    # Use jax.pure_callback to call the Python function
-    # pure_callback requires shape_dtypes for the output
-    out_shapes = (
-        jax.ShapeDtypeStruct(tours.shape, tours.dtype),
-        jax.ShapeDtypeStruct(tour_lens.shape, tour_lens.dtype)
-    )
-    
-    # We pass 'guides' via closure, pure_callback doesn't allow non-JAX objects as args
-    def callback(d, p, t, tl):
-        return reset_guides_callback(d, p, t, tl, guides)
-        
-    return jax.pure_callback(callback, out_shapes, done, pos, tours, tour_lens)
-
-
-def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done, graph_neighbors, w, h, cell_size, guides, revisit_penalty=0.5):
-    """
-    1. Handle resets via pure_callback
-    2. Advance cursors and compute target
-    """
-    E, N = state.idx.shape
-    C = w * h
-    
-    def do_reset():
-        return jax_reset_guides(done, positions, state.tours, state.tour_lens, guides)
-        
-    def skip_reset():
-        return state.tours, state.tour_lens
-        
-    new_tours, new_tour_lens = jax.lax.cond(
-        jnp.any(done),
-        do_reset,
-        skip_reset
-    )
-    
-    # Also reset idx, target, prev_cell, fail_cov for done envs
+    # Tours are immutable accelerator data.  A fresh episode only resets its
+    # cursors; the distance field below reconnects the new spawn to the tour.
     idx = jnp.where(done[:, None], 0, state.idx)
     target = jnp.where(done[:, None], -1, state.target)
     prev_cell = jnp.where(done[:, None], -1, state.prev_cell)
     fail_cov = jnp.where(done[:, None], -1, state.fail_cov)
-    
     state = state._replace(
-        tours=new_tours,
-        tour_lens=new_tour_lens,
         idx=idx,
         target=target,
         prev_cell=prev_cell,
-        fail_cov=fail_cov
+        fail_cov=fail_cov,
     )
     
     # 2. Update logic
@@ -341,18 +238,35 @@ def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done, graph_n
     safe_idx = jnp.minimum(new_idx, state.tour_lens - 1)
     tour_target = state.tours[e_idx, n_idx, safe_idx]
     tour_target = jnp.where(is_finished, -1, tour_target)
+
+    if graph_components is None:
+        # Primarily useful for small standalone callers.  Production passes the
+        # graph's real connected-component labels so goals across walls cannot
+        # be selected merely because they look close in grid coordinates.
+        graph_components = jnp.zeros((C,), dtype=jnp.int32)
+    if free_cells is None:
+        free_cells = jnp.ones((C,), dtype=jnp.bool_)
+    free_cells = jnp.asarray(free_cells, dtype=jnp.bool_)
+    graph_components = jnp.asarray(graph_components, dtype=jnp.int32)
+    mopup_target = select_mopup_targets(
+        cell, covered, free_cells, graph_components, w
+    )
+    goal = jnp.where(is_finished, mopup_target, tour_target)
     
     cost = jnp.where(covered, 1.0 + revisit_penalty, 1.0)
-    dist = jax_bellman_ford_to_target(tour_target, cost, graph_neighbors, C)
+    dist = jax_bellman_ford_to_target(goal, cost, graph_neighbors, C)
     
     waypoint = get_next_waypoint(cell, dist, cost, graph_neighbors, C)
-    waypoint = jnp.where(is_finished, -1, waypoint)
+    waypoint = jnp.where(goal >= 0, waypoint, -1)
+
+    n_covered = jnp.sum(covered, axis=-1, dtype=jnp.int32)
+    fail_cov = jnp.where(waypoint < 0, n_covered[:, None], -1)
     
     new_state = state._replace(
         target=waypoint,
         prev_cell=cell,
-        idx=new_idx
+        fail_cov=fail_cov,
+        idx=new_idx,
     )
     
     return new_state, waypoint, reached
-

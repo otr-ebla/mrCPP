@@ -270,15 +270,15 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
         # ----------------------------------------------------------------
         # Episode bookkeeping (host-side, from the stacked rollout)
         # ----------------------------------------------------------------
-        team_rewards = np.asarray(jnp.mean(traj.reward, axis=-1)) / reward_scale
-        dones = np.asarray(traj.done)                               # (T, E)
-        coverage = np.asarray(traj.coverage)                        # (T, E)
+        host_stats = jax.device_get((
+            jnp.mean(traj.reward, axis=-1), traj.done, traj.coverage,
+            traj.wall_hit, traj.robot_hit, traj.complete, traj.timeout,
+        ))
+        (team_rewards, dones, coverage, wall_hit, robot_hit,
+         complete, timeout) = map(np.asarray, host_stats)
+        team_rewards /= reward_scale
         # Already averaged over the team inside the env, so a value of 0.1 means
         # "one robot in ten collided on this step".
-        wall_hit  = np.asarray(traj.wall_hit)                       # (T, E)
-        robot_hit = np.asarray(traj.robot_hit)                      # (T, E)
-        complete  = np.asarray(traj.complete)                       # (T, E)
-        timeout   = np.asarray(traj.timeout)                        # (T, E)
         for t in range(T):
             ep_reward += team_rewards[t]
             ep_len    += 1

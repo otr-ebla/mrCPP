@@ -136,6 +136,7 @@ def _tanh_normal_log_prob(
     return jnp.sum(log_prob, axis=-1)
 
 
+@jax.jit
 def compute_gae(
     traj: Transition, last_value: jax.Array, gamma: float, gae_lambda: float
 ) -> tuple[jax.Array, jax.Array]:
@@ -223,7 +224,9 @@ class MAPPO:
         self.reward_scale  = float(config.get('reward_scale',  1.0))
         self.huber_delta   = float(config.get('huber_delta',   1.0))
 
-        self._update_fn = jax.jit(self._update)
+        # TrainState buffers are replaced by every update. Donation lets XLA
+        # reuse them instead of holding a second full optimiser/parameter copy.
+        self._update_fn = jax.jit(self._update, donate_argnums=(0, 1))
 
     # ------------------------------------------------------------------
     # Initialisation
