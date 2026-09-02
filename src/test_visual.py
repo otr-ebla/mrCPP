@@ -376,15 +376,16 @@ class MappoController:
         self.expert = BoscoGuide(env) if guided else BoscoExpert(env)
         self.guide_state = None
 
-        if guided:
-            graph = self.expert.graph
-            graph_neighbors = jnp.asarray(graph.neighbors, jnp.int32)
-            graph_free = jnp.asarray(graph.free, jnp.bool_)
-            graph_components = jnp.asarray(graph.component, jnp.int32)
-            graph_centers = jnp.asarray(graph.centers, jnp.float32)
+        graph = self.expert.graph
+        self.graph_neighbors = jnp.asarray(graph.neighbors, jnp.int32)
+        self.graph_free = jnp.asarray(graph.free, jnp.bool_)
+        self.graph_components = jnp.asarray(graph.component, jnp.int32)
+        self.graph_centers = jnp.asarray(graph.centers, jnp.float32)
 
         @jax.jit
-        def policy_step(params, rms, state, obs, guide_state):
+        def policy_step(params, rms, state, obs, guide_state,
+                        graph_neighbors, graph_free, graph_components,
+                        graph_centers):
             obs_n = rms_normalize(rms, obs) if rms is not None else obs
             mean, _ = actor.apply(params, obs_n)
             action = jnp.tanh(mean)                   # deterministic
@@ -422,7 +423,12 @@ class MappoController:
         current_map_id = int(jax.device_get(state.map_id))
         positions = np.asarray(jax.device_get(state.robot_positions))
         if self.guided:
-            self.expert.reset(positions)
+            self.expert.reset(positions, map_id=current_map_id)
+            graph = self.expert.graph
+            self.graph_neighbors = jnp.asarray(graph.neighbors, jnp.int32)
+            self.graph_free = jnp.asarray(graph.free, jnp.bool_)
+            self.graph_components = jnp.asarray(graph.component, jnp.int32)
+            self.graph_centers = jnp.asarray(graph.centers, jnp.float32)
         else:
             self.expert.reset(positions, map_id=current_map_id)
         owner = self.expert.owner.copy()
@@ -474,7 +480,9 @@ class MappoController:
 
     def step(self, state, snap: dict):
         state, self.obs, self.guide_state, rewards, terminated, truncated = self._fn(
-            self.params, self.obs_rms, state, self.obs, self.guide_state
+            self.params, self.obs_rms, state, self.obs, self.guide_state,
+            self.graph_neighbors, self.graph_free, self.graph_components,
+            self.graph_centers,
         )
         return state, rewards, terminated, truncated
 
@@ -648,7 +656,10 @@ def _load_checkpoint(
 
 def main() -> None:
     _default_cfg  = os.path.join(_ROOT, 'config', 'mappo_baseline.yaml')
-    _default_ckpt = os.path.join(_ROOT, 'checkpoints', 'checkpoint_final.pkl')
+    # The current environment/actor layout matches the BOSCO-guided checkpoint.
+    # checkpoint_final.pkl predates the current 70-ray observation and fails on
+    # its first forward pass with an incompatible Dense_0 input shape.
+    _default_ckpt = os.path.join(_ROOT, 'checkpoints', 'checkpoint_bosco.pkl')
 
     parser = argparse.ArgumentParser(description='Visualise a coverage controller with pygame')
     parser.add_argument('--policy',     default='mappo', choices=['mappo', 'bosco'],
@@ -658,7 +669,7 @@ def main() -> None:
                         help='Override the episode step limit; 0 = take it from the '
                              'config (default: 0)')
     parser.add_argument('--checkpoint', default=_default_ckpt,
-                        help='Path to .pkl checkpoint (default: checkpoints/checkpoint_final.pkl)')
+                        help='Path to .pkl checkpoint (default: checkpoints/checkpoint_bosco.pkl)')
     parser.add_argument('--config',     default=_default_cfg,
                         help='Path to YAML config file')
     parser.add_argument('--episodes',   type=int, default=0,

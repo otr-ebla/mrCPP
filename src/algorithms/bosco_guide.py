@@ -79,8 +79,9 @@ class BoscoGuide(BoscoExpert):
 
     # -- episode setup ------------------------------------------------------
 
-    def reset(self, positions: np.ndarray) -> dict:
-        info = super().reset(positions)
+    def reset(self, positions: np.ndarray, map_id: int | None = None) -> dict:
+        """Reset the guide against the map used by the current episode."""
+        info = super().reset(positions, map_id=map_id)
         n = self.n
         self.target = np.full(n, -1, dtype=np.int64)
         # -1 forces the first `update` to do the full bookkeeping for every robot.
