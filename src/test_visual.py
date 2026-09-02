@@ -19,6 +19,7 @@ import math
 import os
 import pickle
 import sys
+import time
 
 import numpy as np
 import pygame
@@ -34,6 +35,8 @@ import jax
 import jax.numpy as jnp
 
 from src.algorithms.bosco import BoscoExpert
+from src.algorithms.bosco_guide import BoscoGuide
+from src.algorithms.jax_bosco import JaxGuideState, jax_guide_step
 from src.algorithms.mappo import RunningMeanStd, rms_normalize
 from src.envs.coverage_vector_env import MultiRobotCoverageEnv
 from src.models.actor_critic import Actor
@@ -365,32 +368,113 @@ class MappoController:
     owner = None
 
     def __init__(self, env: MultiRobotCoverageEnv, actor: Actor, params,
-                 obs_rms: RunningMeanStd | None):
+                 obs_rms: RunningMeanStd | None, guided: bool = False,
+                 guide_bonus: float = 2.0):
         self.env, self.params, self.obs_rms = env, params, obs_rms
-        from src.algorithms.bosco import BoscoExpert
-        self.expert = BoscoExpert(env)
+        self.guided = guided
+        self.guide_bonus = float(guide_bonus)
+        self.expert = BoscoGuide(env) if guided else BoscoExpert(env)
+        self.guide_state = None
+
+        if guided:
+            graph = self.expert.graph
+            graph_neighbors = jnp.asarray(graph.neighbors, jnp.int32)
+            graph_free = jnp.asarray(graph.free, jnp.bool_)
+            graph_components = jnp.asarray(graph.component, jnp.int32)
+            graph_centers = jnp.asarray(graph.centers, jnp.float32)
 
         @jax.jit
-        def policy_step(params, rms, state, obs):
+        def policy_step(params, rms, state, obs, guide_state):
             obs_n = rms_normalize(rms, obs) if rms is not None else obs
             mean, _ = actor.apply(params, obs_n)
             action = jnp.tanh(mean)                   # deterministic
             next_state, rewards, terminated, truncated = env.step(state, action)
-            return next_state, env.get_obs(next_state), rewards, terminated, truncated
+
+            if guided:
+                done = (terminated | truncated)[None]
+                guide_state, waypoint, reached = jax_guide_step(
+                    guide_state,
+                    next_state.robot_positions[None],
+                    next_state.coverage_grid[None],
+                    done,
+                    graph_neighbors,
+                    env.grid_w,
+                    env.grid_h,
+                    env.cell_size,
+                    free_cells=graph_free,
+                    graph_components=graph_components,
+                )
+                valid = waypoint[0] >= 0
+                safe = jnp.maximum(waypoint[0], 0)
+                coords = graph_centers[safe]
+                targets = jnp.where(
+                    valid[:, None], coords, next_state.robot_positions
+                )
+                next_state = env.set_bosco_targets(next_state, targets)
+                rewards = rewards + self.guide_bonus * reached[0].astype(jnp.float32)
+
+            return (next_state, env.get_obs(next_state), guide_state,
+                    rewards, terminated, truncated)
 
         self._fn = policy_step
 
-    def reset(self, state) -> None:
-        self.obs = self.env.get_obs(state)
+    def reset(self, state):
         current_map_id = int(jax.device_get(state.map_id))
-        self.expert.reset(np.asarray(state.robot_positions), map_id=current_map_id)
+        positions = np.asarray(jax.device_get(state.robot_positions))
+        if self.guided:
+            self.expert.reset(positions)
+        else:
+            self.expert.reset(positions, map_id=current_map_id)
         owner = self.expert.owner.copy()
         owner[owner < 0] = self.env.num_robots
         self.owner = owner.reshape(self.env.grid_h, self.env.grid_w)
 
+        if self.guided:
+            coverage = np.asarray(jax.device_get(state.coverage_grid))
+            targets, _ = self.expert.update(positions, coverage)
+            valid = targets >= 0
+            safe = np.maximum(targets, 0)
+            coords = self.expert.graph.centers[safe]
+            target_coords = np.where(valid[:, None], coords, positions)
+            state = self.env.set_bosco_targets(
+                state, jnp.asarray(target_coords, jnp.float32)
+            )
+
+            max_tour_len = 2048
+            tours = np.full(
+                (1, self.env.num_robots, max_tour_len), -1, dtype=np.int32
+            )
+            tour_lens = np.zeros((1, self.env.num_robots), dtype=np.int32)
+            for robot, tour in enumerate(self.expert.tours):
+                length = min(len(tour), max_tour_len)
+                tours[0, robot, :length] = tour[:length]
+                tour_lens[0, robot] = length
+
+            cell_size = self.env.cell_size
+            col = np.clip(
+                (positions[:, 0] / cell_size).astype(np.int32),
+                0, self.env.grid_w - 1,
+            )
+            row = np.clip(
+                (positions[:, 1] / cell_size).astype(np.int32),
+                0, self.env.grid_h - 1,
+            )
+            cell = row * self.env.grid_w + col
+            self.guide_state = JaxGuideState(
+                target=jnp.asarray(targets[None], jnp.int32),
+                prev_cell=jnp.asarray(cell[None], jnp.int32),
+                fail_cov=jnp.full((1, self.env.num_robots), -1, jnp.int32),
+                idx=jnp.zeros((1, self.env.num_robots), jnp.int32),
+                tours=jnp.asarray(tours, jnp.int32),
+                tour_lens=jnp.asarray(tour_lens, jnp.int32),
+            )
+
+        self.obs = self.env.get_obs(state)
+        return state
+
     def step(self, state, snap: dict):
-        state, self.obs, rewards, terminated, truncated = self._fn(
-            self.params, self.obs_rms, state, self.obs
+        state, self.obs, self.guide_state, rewards, terminated, truncated = self._fn(
+            self.params, self.obs_rms, state, self.obs, self.guide_state
         )
         return state, rewards, terminated, truncated
 
@@ -411,7 +495,7 @@ class BoscoController:
         self._step = jax.jit(env.step)
         self.owner = None
 
-    def reset(self, state) -> None:
+    def reset(self, state):
         current_map_id = int(jax.device_get(state.map_id))
         info = self.expert.reset(np.asarray(state.robot_positions), map_id=current_map_id)
         # -1 (unowned) folds onto the palette's trailing fallback row.
@@ -419,6 +503,7 @@ class BoscoController:
         owner[owner < 0] = self.env.num_robots
         self.owner = owner.reshape(self.env.grid_h, self.env.grid_w)
         print(f"  partition {info['region_sizes'].tolist()}", end='', flush=True)
+        return state
 
     def step(self, state, snap: dict):
         actions = self.expert.act(
@@ -442,7 +527,7 @@ def run_episode(
 ) -> float | None:
     """Run one episode. Returns total reward, or None if the user quit."""
     state = env.reset(key)
-    controller.reset(state)
+    state = controller.reset(state)
 
     ep_reward = 0.0
     
@@ -519,12 +604,21 @@ def run_episode(
             return ep_reward
 
 
-def _load_checkpoint(path: str, device: jax.Device) -> tuple[dict, RunningMeanStd | None, int]:
+def _load_checkpoint(
+    path: str, device: jax.Device
+) -> tuple[dict, RunningMeanStd | None, int, bool, float]:
     """Read a JAX training checkpoint and place its arrays on `device`."""
-    try:
-        with open(path, 'rb') as f:
-            ckpt = pickle.load(f)
-    except (pickle.UnpicklingError, UnicodeDecodeError, EOFError) as exc:
+    exc = None
+    for attempt in range(5):
+        try:
+            with open(path, 'rb') as f:
+                ckpt = pickle.load(f)
+            break
+        except (OSError, pickle.UnpicklingError, UnicodeDecodeError, EOFError) as error:
+            exc = error
+            if attempt < 4:
+                time.sleep(0.1)
+    else:
         raise SystemExit(
             f"Cannot read '{path}' as a JAX checkpoint ({exc}).\n"
             "PyTorch-era '.pt' checkpoints are not loadable by the JAX policy: "
@@ -542,7 +636,14 @@ def _load_checkpoint(path: str, device: jax.Device) -> tuple[dict, RunningMeanSt
     rms = None
     if ckpt.get('obs_rms') is not None:
         rms = RunningMeanStd(*jax.device_put(tuple(ckpt['obs_rms']), device))
-    return params, rms, int(ckpt.get('update', 0))
+    # Older guided checkpoints wrote guide_dim=0 after the waypoint moved into
+    # the continuous observation prefix. Preserve compatibility with the
+    # canonical BOSCO filename; new checkpoints carry an explicit flag.
+    guided = bool(ckpt.get(
+        'bosco_guided', os.path.basename(path) == 'checkpoint_bosco.pkl'
+    ))
+    return (params, rms, int(ckpt.get('update', 0)), guided,
+            float(ckpt.get('guide_bonus', 2.0)))
 
 
 def main() -> None:
@@ -568,18 +669,30 @@ def main() -> None:
                         help='PRNG seed for episode resets (default: 0)')
     parser.add_argument('--no-obs-norm', action='store_true',
                         help='Disable observation normalisation')
+    parser.add_argument('--bosco-guided', action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help='Enable/disable BOSCO waypoint observations. By default '
+                             'this is detected from checkpoint metadata/name.')
+    parser.add_argument('--guide-bonus', type=float, default=None,
+                        help='Override BOSCO arrival bonus used for displayed reward; '
+                             'default reads checkpoint metadata (2.0 for old files).')
     parser.add_argument('--backend',    default='cpu',
                         choices=['auto', 'metal', 'cuda', 'gpu', 'cpu'],
                         help='JAX backend. Default "cpu": a single-env rollout is '
                              'tiny, so the CPU beats accelerator launch overhead')
     parser.add_argument('--humans', nargs='?', type=int, const=3, default=0, help='Number of humans')
+    parser.add_argument('--terminate-on-collision',
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help='Override collision termination; default uses the '
+                             'training config.')
     args = parser.parse_args()
 
     config    = load_config(args.config)
     env_cfg   = config.get('env',   {})
     if args.humans > 0:
         env_cfg['num_humans'] = args.humans
-    env_cfg['terminate_on_collision'] = True
+    if args.terminate_on_collision is not None:
+        env_cfg['terminate_on_collision'] = args.terminate_on_collision
     model_cfg = config.get('model', {})
     train_cfg = config.get('train', {})
 
@@ -613,7 +726,9 @@ def main() -> None:
             hidden_size=model_cfg.get('hidden_size', 128),
         )
 
-        params, obs_rms, update = _load_checkpoint(args.checkpoint, device)
+        params, obs_rms, update, checkpoint_guided, checkpoint_guide_bonus = _load_checkpoint(
+            args.checkpoint, device
+        )
         print(f"Loaded: {args.checkpoint}  (update {update})")
 
         if args.no_obs_norm or not train_cfg.get('normalize_obs', True):
@@ -624,7 +739,16 @@ def main() -> None:
         else:
             print("Observation normalisation: loaded from checkpoint.")
 
-        controller = MappoController(env, actor, params, obs_rms)
+        guided = checkpoint_guided if args.bosco_guided is None else args.bosco_guided
+        guide_bonus = (checkpoint_guide_bonus if args.guide_bonus is None
+                       else args.guide_bonus)
+        if guided:
+            print(f"Guidance: JAX BOSCO waypoints enabled; bonus={guide_bonus:g} "
+                  "(matches training).")
+        controller = MappoController(
+            env, actor, params, obs_rms, guided=guided,
+            guide_bonus=guide_bonus,
+        )
 
     # -- Pygame setup --
     # -- Pygame setup --

@@ -88,8 +88,16 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms) -> N
         'critic_opt':    jax.device_get(critic_state.opt_state),
         'obs_rms':       jax.device_get(rms),
     }
-    with open(path, 'wb') as f:
-        pickle.dump(payload, f)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def load_checkpoint(path: str, actor_state, critic_state, device):

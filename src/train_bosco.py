@@ -82,7 +82,6 @@ from src.train_simple import (
     init_wandb,
     linear_lr_decay,
     wandb,
-    window,
 )
 from src.utils.config_parser import load_config
 from src.utils.jax_device import describe, select_device
@@ -93,7 +92,7 @@ from src.utils.jax_device import describe, select_device
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
-                    guide_dim: int) -> None:
+                    guide_dim: int, guide_bonus: float = 2.0) -> None:
     """`train_simple`'s payload plus the guidance width the actor was built for.
 
     The extra key makes the observation layout self-describing — an actor trained
@@ -108,9 +107,22 @@ def save_checkpoint(path: str, update: int, actor_state, critic_state, rms,
         'critic_opt':    jax.device_get(critic_state.opt_state),
         'obs_rms':       jax.device_get(rms),
         'guide_dim':     int(guide_dim),
+        'bosco_guided':  True,
+        'guide_bonus':   float(guide_bonus),
     }
-    with open(path, 'wb') as f:
-        pickle.dump(payload, f)
+    # Publish only a fully-written pickle so evaluators can safely load it while
+    # training continues. os.replace is atomic when source and target share a
+    # directory/filesystem.
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 def _trunk_key(params, in_dim: int) -> str | None:
     """Name of the actor layer whose kernel takes `in_dim` inputs, if unique."""
@@ -157,6 +169,99 @@ class GuidedCarry(NamedTuple):
     gstate:    object
     rms:       object
     guide_state: JaxGuideState
+    episode_stats: object
+    smoothed_col_rate: jax.Array
+
+
+class DeviceEpisodeStats(NamedTuple):
+    """Episode accumulators and a fixed-size recent-history ring on device."""
+
+    reward:    jax.Array
+    length:    jax.Array
+    wall:      jax.Array
+    robot:     jax.Array
+    hits:      jax.Array
+    recent_reward:   jax.Array
+    recent_coverage: jax.Array
+    recent_length:   jax.Array
+    recent_wall:     jax.Array
+    recent_robot:    jax.Array
+    recent_hits:     jax.Array
+    recent_outcome:  jax.Array
+    ring_pos:   jax.Array
+    ring_count: jax.Array
+    total_count: jax.Array
+
+
+def _episode_stats_init(num_envs: int) -> DeviceEpisodeStats:
+    zeros_e = jnp.zeros((num_envs,), jnp.float32)
+    zeros_w = jnp.zeros((_WINDOW,), jnp.float32)
+    return DeviceEpisodeStats(
+        reward=zeros_e,
+        length=jnp.zeros((num_envs,), jnp.int32),
+        wall=zeros_e,
+        robot=zeros_e,
+        hits=zeros_e,
+        recent_reward=zeros_w,
+        recent_coverage=zeros_w,
+        recent_length=zeros_w,
+        recent_wall=zeros_w,
+        recent_robot=zeros_w,
+        recent_hits=zeros_w,
+        recent_outcome=jnp.zeros((_WINDOW,), jnp.int32),
+        ring_pos=jnp.int32(0),
+        ring_count=jnp.int32(0),
+        total_count=jnp.int32(0),
+    )
+
+
+def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
+                        reached: jax.Array, reward_scale: float) -> DeviceEpisodeStats:
+    """Consume one vectorised transition without copying trajectory data to host."""
+    stats = stats._replace(
+        reward=stats.reward + jnp.mean(trans.reward, axis=-1) / reward_scale,
+        length=stats.length + 1,
+        wall=stats.wall + trans.wall_hit,
+        robot=stats.robot + trans.robot_hit,
+        hits=stats.hits + jnp.mean(reached, axis=-1),
+    )
+
+    def one_env(s, xs):
+        done, coverage, complete, timeout, env_idx = xs
+
+        def finish(x):
+            pos = x.ring_pos
+            outcome = jnp.where(
+                complete > 0.5, jnp.int32(_SUCCESS),
+                jnp.where(timeout > 0.5, jnp.int32(_TIMEOUT), jnp.int32(_COLLISION)),
+            )
+            x = x._replace(
+                recent_reward=x.recent_reward.at[pos].set(x.reward[env_idx]),
+                recent_coverage=x.recent_coverage.at[pos].set(coverage),
+                recent_length=x.recent_length.at[pos].set(x.length[env_idx]),
+                recent_wall=x.recent_wall.at[pos].set(x.wall[env_idx]),
+                recent_robot=x.recent_robot.at[pos].set(x.robot[env_idx]),
+                recent_hits=x.recent_hits.at[pos].set(x.hits[env_idx]),
+                recent_outcome=x.recent_outcome.at[pos].set(outcome),
+                reward=x.reward.at[env_idx].set(0.0),
+                length=x.length.at[env_idx].set(0),
+                wall=x.wall.at[env_idx].set(0.0),
+                robot=x.robot.at[env_idx].set(0.0),
+                hits=x.hits.at[env_idx].set(0.0),
+                ring_pos=(pos + 1) % _WINDOW,
+                ring_count=jnp.minimum(x.ring_count + 1, _WINDOW),
+                total_count=x.total_count + 1,
+            )
+            return x
+
+        return jax.lax.cond(done > 0.5, finish, lambda x: x, s), None
+
+    env_idx = jnp.arange(trans.done.shape[0], dtype=jnp.int32)
+    stats, _ = jax.lax.scan(
+        one_env, stats,
+        (trans.done, trans.coverage, trans.complete, trans.timeout, env_idx),
+    )
+    return stats
 
 
 class GuidedRollout:
@@ -191,7 +296,7 @@ class GuidedRollout:
         
         def jitted_run(actor_params, critic_params, carry, keys):
             def scan_step(c, k):
-                state, obs, gstate, rms, guide_state = c
+                state, obs, gstate, rms, guide_state, episode_stats, smoothed_col_rate = c
                 
                 obs_n, action, z, log_prob, value, rms = act(
                     actor_params, critic_params, rms, obs, gstate, k
@@ -234,8 +339,15 @@ class GuidedRollout:
                     complete=info['complete'],
                     timeout=info['timeout'],
                 )
+
+                episode_stats = _episode_stats_step(
+                    episode_stats, trans, reached, self.mappo.reward_scale
+                )
                 
-                next_carry = GuidedCarry(next_state, next_obs, next_gstate, rms, new_guide_state)
+                next_carry = GuidedCarry(
+                    next_state, next_obs, next_gstate, rms, new_guide_state,
+                    episode_stats, smoothed_col_rate,
+                )
                 return next_carry, (trans, reached)
                 
             return jax.lax.scan(scan_step, carry, keys)
@@ -287,7 +399,10 @@ class GuidedRollout:
             tour_lens=jnp.asarray(tour_lens, jnp.int32)
         )
         
-        return GuidedCarry(state, obs, gstate, rms_init(self.env.norm_dim), guide_state)
+        return GuidedCarry(
+            state, obs, gstate, rms_init(self.env.norm_dim), guide_state,
+            _episode_stats_init(E), jnp.float32(0.1),
+        )
 
     def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int, key: jax.Array):
         keys = jax.random.split(key, num_steps)
@@ -375,7 +490,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
     lr_decay      = train_cfg.get('lr_decay',       True)
     lr_actor_0    = train_cfg.get('lr_actor',       3e-4)
     lr_critic_0   = train_cfg.get('lr_critic',      1e-3)
-    reward_scale  = train_cfg.get('reward_scale',   1.0)
 
     key = jax.random.PRNGKey(train_cfg.get('seed', 0))
     key, init_key, reset_key = jax.random.split(key, 3)
@@ -430,44 +544,25 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'guide_hits_per_episode', 'guide_hit_rate',
                                 'actor_loss', 'critic_loss', 'entropy', 'std'])
 
-    # Per-env accumulators for the episode currently in flight; the rollout is
-    # cut at an arbitrary step, so these must survive across updates.
-    ep_reward = np.zeros(E, dtype=np.float64)
-    ep_len    = np.zeros(E, dtype=np.int64)
-    ep_wall   = np.zeros(E, dtype=np.float64)
-    ep_robot  = np.zeros(E, dtype=np.float64)
-    ep_hit    = np.zeros(E, dtype=np.float64)   # team-mean waypoints reached
-
-    ep_rewards: list[float] = []
-    ep_coverages: list[float] = []
-    ep_lengths: list[int] = []
-    ep_walls: list[float] = []
-    ep_robots: list[float] = []
-    ep_hits: list[float] = []
-    ep_outcomes: list[int] = []
-    ep_count = 0
     best_mean_reward = -np.inf
 
     for update in range(start_update, total_updates + 1):
         lr_a = linear_lr_decay(lr_actor_0,  update, total_updates) if lr_decay else lr_actor_0
         lr_c = linear_lr_decay(lr_critic_0, update, total_updates) if lr_decay else lr_critic_0
 
-        if update == start_update:
-            smoothed_col_rate = 0.1
-        else:
-            total_col_rate = float(traj.wall_hit.mean()) + float(traj.robot_hit.mean())
-            smoothed_col_rate = 0.9 * smoothed_col_rate + 0.1 * total_col_rate
-            
-        human_prob = max(0.0, min(1.0, 1.0 - (smoothed_col_rate / 0.1)))
-        
-        # update in env state
-        import jax.numpy as jnp
-        carry = carry._replace(env_state=vec_env.update_human_stop_prob(carry.env_state, jnp.full((E,), human_prob, dtype=jnp.float32)))
+        human_prob = jnp.clip(1.0 - carry.smoothed_col_rate / 0.1, 0.0, 1.0)
+        carry = carry._replace(env_state=vec_env.update_human_stop_prob(
+            carry.env_state, jnp.full((E,), human_prob, dtype=jnp.float32)
+        ))
 
         key, rollout_key = jax.random.split(key)
         prev_rms = carry.rms
         carry, traj, last_value, hits = rollout.run(
             actor_state.params, critic_state.params, carry, T, rollout_key
+        )
+        total_col_rate = jnp.mean(traj.wall_hit) + jnp.mean(traj.robot_hit)
+        carry = carry._replace(
+            smoothed_col_rate=0.9 * carry.smoothed_col_rate + 0.1 * total_col_rate
         )
         if not normalize_obs:
             carry = carry._replace(rms=prev_rms)
@@ -479,63 +574,45 @@ def train(config_path: str, save_dir: str, resume: str | None,
         )
 
         # ----------------------------------------------------------------
-        # Episode bookkeeping (host-side, from the stacked rollout)
-        # ----------------------------------------------------------------
-        # Includes the arrival bonus: it is part of what the policy optimises, so
-        # hiding it from the logged return would make the reward curve describe a
-        # different objective than the one being maximised. `guide_hits` reports
-        # the shaping separately, and `mean_ep_coverage` stays the success metric.
-        host_stats = jax.device_get((
-            jnp.mean(traj.reward, axis=-1), traj.done, traj.coverage,
-            traj.wall_hit, traj.robot_hit, traj.complete, traj.timeout, hits,
-        ))
-        (team_rewards, dones, coverage, wall_hit, robot_hit,
-         complete, timeout, host_hits) = map(np.asarray, host_stats)
-        team_rewards /= reward_scale
-        hit_rate_t = host_hits.mean(axis=2)          # (T, E) team-mean per step
-        for t in range(T):
-            ep_reward += team_rewards[t]
-            ep_len    += 1
-            ep_wall   += wall_hit[t]
-            ep_robot  += robot_hit[t]
-            ep_hit    += hit_rate_t[t]
-            for e in np.nonzero(dones[t])[0]:
-                ep_rewards.append(float(ep_reward[e]))
-                ep_coverages.append(float(coverage[t, e]))
-                ep_lengths.append(int(ep_len[e]))
-                ep_walls.append(float(ep_wall[e]))
-                ep_robots.append(float(ep_robot[e]))
-                ep_hits.append(float(ep_hit[e]))
-                ep_outcomes.append(
-                    _SUCCESS   if complete[t, e] > 0.5 else
-                    _TIMEOUT   if timeout[t, e]  > 0.5 else
-                    _COLLISION
-                )
-                ep_reward[e] = ep_wall[e] = ep_robot[e] = ep_hit[e] = 0.0
-                ep_len[e] = 0
-                ep_count += 1
-
-        # ----------------------------------------------------------------
         # Logging
         # ----------------------------------------------------------------
         if update % log_interval == 0:
-            mean_ep_r   = window(ep_rewards)
-            mean_ep_cov = window(ep_coverages)
-            mean_ep_len = window(ep_lengths)
-            last_cov    = float(coverage[-1].mean())
-            ep_wall_mean  = window(ep_walls)
-            ep_robot_mean = window(ep_robots)
-            ep_hit_mean   = window(ep_hits)
-            wall_rate  = float(wall_hit.mean())
-            robot_rate = float(robot_hit.mean())
+            s = carry.episode_stats
+            compact = jax.device_get((
+                s.recent_reward, s.recent_coverage, s.recent_length,
+                s.recent_wall, s.recent_robot, s.recent_hits,
+                s.recent_outcome, s.ring_count, s.total_count,
+                jnp.mean(traj.coverage[-1]), jnp.mean(traj.wall_hit),
+                jnp.mean(traj.robot_hit), jnp.mean(hits), metrics,
+            ))
+            (recent_reward, recent_coverage, recent_length, recent_wall,
+             recent_robot, recent_hits, recent_outcome, ring_count,
+             ep_count, last_cov, wall_rate, robot_rate, guide_rate,
+             losses) = compact
+            count = int(ring_count)
+            ep_count = int(ep_count)
+            valid = slice(0, count)
+
+            def recent_mean(values):
+                return float(np.mean(np.asarray(values)[valid])) if count else 0.0
+
+            mean_ep_r = recent_mean(recent_reward)
+            mean_ep_cov = recent_mean(recent_coverage)
+            mean_ep_len = recent_mean(recent_length)
+            ep_wall_mean = recent_mean(recent_wall)
+            ep_robot_mean = recent_mean(recent_robot)
+            ep_hit_mean = recent_mean(recent_hits)
+            last_cov = float(last_cov)
+            wall_rate = float(wall_rate)
+            robot_rate = float(robot_rate)
             # Fraction of robot-steps that ended on the waypoint. A robot needs
             # ~5 steps to cross a 0.5 m cell at v_max, so 0.2 is the arithmetic
             # ceiling, but BOSCO itself only reaches 0.095 on this map — a 90°
             # lane change costs ~16 steps of turning in place, which buys no
             # waypoint. That measured 0.095, not the ceiling, is what a policy
             # tracking the tour as well as the planner does looks like.
-            guide_rate = float(host_hits.mean())
-            outcomes = np.asarray(ep_outcomes[-_WINDOW:], dtype=np.int64)
+            guide_rate = float(guide_rate)
+            outcomes = np.asarray(recent_outcome)[valid]
             if outcomes.size:
                 completion_rate    = float(np.mean(outcomes == _SUCCESS))
                 timeout_rate       = float(np.mean(outcomes == _TIMEOUT))
@@ -543,7 +620,6 @@ def train(config_path: str, save_dir: str, resume: str | None,
             else:
                 completion_rate = timeout_rate = collision_end_rate = 0.0
             env_steps = update * T * E
-            losses = jax.device_get(metrics)
             print(
                 f"Update {update:5d}/{total_updates} | "
                 f"episodes={ep_count:6d} | "
@@ -608,14 +684,15 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 best_mean_reward = mean_ep_r
                 save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
                                 update, actor_state, critic_state, carry.rms,
-                                tail_dim)
+                                tail_dim, guide_bonus)
                 print(f"  → best policy saved (mean_ep_r={mean_ep_r:.3f})")
                 if run is not None:
                     run.summary['best_mean_ep_reward'] = mean_ep_r
                     run.summary['best_update'] = update
 
     save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
-                    total_updates, actor_state, critic_state, carry.rms, tail_dim)
+                    total_updates, actor_state, critic_state, carry.rms,
+                    tail_dim, guide_bonus)
     if run is not None:
         run.finish()
     return actor_state, critic_state, carry.rms

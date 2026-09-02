@@ -13,16 +13,13 @@ env:
   # robot needs 5 steps to reach a new cell. 302 free cells / 3 robots ≈ 101
   # cells each × 5 = ~505 steps for a *perfect* sweep with zero overlap and no
   # turning. 500 was therefore the exact theoretical minimum, i.e. unreachable
-  # in practice; 1000 leaves 2× slack so full coverage is physically possible.
-  max_steps: 1000        # steps before truncation
+  # in practice; 2000 leaves 4× slack so full coverage is physically possible.
+  max_steps: 3000        # steps before truncation
   v_max: 1.0             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
   omega_max: 1.0         # max angular velocity (rad/s)
-  # soft collisions: a robot that hits a wall or a teammate keeps its position for
-  # that step (linear velocity zeroed, rotation still applied so it can turn away),
-  # pays kappa and carries on. Under hard termination the early random policy ended
-  # every episode after ~120 steps, so the team never lived long enough to reach
-  # the far rooms — exploration died before navigation could be learned.
-  terminate_on_collision: false
+  # Hard collisions: a wall, robot or human collision ends the team episode.
+  # This keeps training and strict visual evaluation under the same dynamics.
+  terminate_on_collision: true
   # local coverage patch: gives actors a birds-eye view of nearby coverage without
   # breaking decentralised execution — this is the key driver of efficient coverage
   use_local_coverage_obs: true
@@ -34,9 +31,9 @@ env:
   # steps therefore cost 2.0, leaving new coverage strongly profitable while
   # making stationary/repetitive behaviour visible to the optimiser.
   beta: 0.5              # no new cell this step (moving or stationary)
-  # A blocked move is already rejected by the dynamics. Its extra penalty is
-  # half the value of a newly covered cell: material, but still recoverable.
-  kappa: 5.0             # collision penalty per step, charged to the offender
+  # A collision is both terminal and heavily penalised so its final transition
+  # produces a clear avoidance signal.
+  kappa: 80.0             # terminal collision penalty, charged to the offender
   tau: 0.05              # small universal pressure to finish sooner
   # inter-robot proximity penalty: continuous soft repulsion before hard collision
   # fires when robots are within safe_dist_factor × robot_radius of each other
@@ -62,7 +59,7 @@ model:
 train:
   num_envs: 8            # parallel environment workers (set to your CPU core count)
   rollout_steps: 256     # T — steps per env per update; total = num_envs × T
-  total_updates: 3000    # 3000 × 8 × 256 = 6.1M environment steps
+  total_updates: 6000    # 3000 × 8 × 256 = 6.1M environment steps
   log_interval: 10       # print every N updates
   save_interval: 100     # save checkpoint every N updates
   gamma: 0.99
@@ -79,7 +76,7 @@ train:
   # deterministic before it could learn to thread doorways. 3e-3 holds sigma up
   # for the first few thousand episodes so robots keep trying different
   # manoeuvres at narrow passages.
-  entropy_coef: 3.0e-3
+  entropy_coef: 6.0e-3
   max_grad_norm: 10.0
   # Reward weights are in task units (a completion bonus is worth 200), which
   # puts undiscounted returns in the hundreds and made the critic loss explode.
