@@ -50,7 +50,7 @@ class VecEnv:
         self.reset = jax.jit(self._reset)
         self.step = jax.jit(self._step)
         self.update_bosco = jax.jit(self._update_bosco)
-        self.update_human_stop_prob = jax.jit(self._update_human_stop_prob)
+        self.update_ghost_robot_prob = jax.jit(self._update_ghost_robot_prob)
 
     @property
     def num_robots(self) -> int:
@@ -140,9 +140,9 @@ class VecEnv:
 
         return jax.vmap(one)(state, actions)
 
-    def _update_human_stop_prob(self, state: EnvState, probs: jax.Array):
+    def _update_ghost_robot_prob(self, state: EnvState, probs: jax.Array):
         def one(s: EnvState, p: jax.Array):
-            return self.env.set_human_stop_prob(s, p)
+            return self.env.set_ghost_robot_prob(s, p)
         return jax.vmap(one)(state, probs)
 
     def _update_bosco(self, state: EnvState, targets: jax.Array):

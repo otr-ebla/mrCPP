@@ -76,7 +76,7 @@ train:
   # deterministic before it could learn to thread doorways. 3e-3 holds sigma up
   # for the first few thousand episodes so robots keep trying different
   # manoeuvres at narrow passages.
-  entropy_coef: 6.0e-3
+  entropy_coef: 0.008
   max_grad_norm: 10.0
   # Reward weights are in task units (a completion bonus is worth 200), which
   # puts undiscounted returns in the hundreds and made the critic loss explode.

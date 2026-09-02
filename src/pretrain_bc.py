@@ -291,7 +291,11 @@ def collect(vec_env, experts, state, obs, buffers, rng, steps, noise_std, stats)
     train_buf, val_buf, n_val = buffers
     E, N = vec_env.E, vec_env.num_robots
 
-    for _ in range(steps):
+    from src.utils.human_curriculum import ghost_robot_probability
+
+    smoothed_col_rate = 0.0
+    smoothed_coverage_rate = 0.0
+    for step_idx in range(steps):
         pos = np.asarray(state.robot_positions)          # (E, N, 2)
         hdg = np.asarray(state.robot_headings)           # (E, N)
         cov = np.asarray(state.coverage_grid)            # (E, H, W)
@@ -314,16 +318,18 @@ def collect(vec_env, experts, state, obs, buffers, rng, steps, noise_std, stats)
             ).astype(np.float32)
 
         
-        if step_idx == 0:
-            smoothed_col_rate = 0.1
-        else:
+        if step_idx > 0:
             total_col_rate = float(info['wall_collision_rate'].mean()) + float(info['robot_collision_rate'].mean())
             smoothed_col_rate = 0.9 * smoothed_col_rate + 0.1 * total_col_rate
-            
-        human_prob = max(0.0, min(1.0, 1.0 - (smoothed_col_rate / 0.1)))
-        
-        # update in env state
-        state = vec_env.update_human_stop_prob(state, jnp.full((E,), human_prob, dtype=jnp.float32))
+            smoothed_coverage_rate = (
+                0.9 * smoothed_coverage_rate
+                + 0.1 * float(info['coverage_ratio'].mean())
+            )
+
+        ghost_prob = ghost_robot_probability(smoothed_col_rate, smoothed_coverage_rate)
+        state = vec_env.update_ghost_robot_prob(
+            state, jnp.full((E,), ghost_prob, dtype=jnp.float32)
+        )
 
         state, obs, _, _, done, info, _ = vec_env.step(state, jnp.asarray(executed))
 

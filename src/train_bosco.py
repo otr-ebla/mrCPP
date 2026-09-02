@@ -85,6 +85,7 @@ from src.train_simple import (
 )
 from src.utils.config_parser import load_config
 from src.utils.jax_device import describe, select_device
+from src.utils.human_curriculum import ghost_robot_probability
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +172,7 @@ class GuidedCarry(NamedTuple):
     guide_state: JaxGuideState
     episode_stats: object
     smoothed_col_rate: jax.Array
+    smoothed_coverage_rate: jax.Array
 
 
 class DeviceEpisodeStats(NamedTuple):
@@ -296,7 +298,8 @@ class GuidedRollout:
         
         def jitted_run(actor_params, critic_params, carry, keys):
             def scan_step(c, k):
-                state, obs, gstate, rms, guide_state, episode_stats, smoothed_col_rate = c
+                (state, obs, gstate, rms, guide_state, episode_stats,
+                 smoothed_col_rate, smoothed_coverage_rate) = c
                 
                 obs_n, action, z, log_prob, value, rms = act(
                     actor_params, critic_params, rms, obs, gstate, k
@@ -346,7 +349,7 @@ class GuidedRollout:
                 
                 next_carry = GuidedCarry(
                     next_state, next_obs, next_gstate, rms, new_guide_state,
-                    episode_stats, smoothed_col_rate,
+                    episode_stats, smoothed_col_rate, smoothed_coverage_rate,
                 )
                 return next_carry, (trans, reached)
                 
@@ -401,7 +404,7 @@ class GuidedRollout:
         
         return GuidedCarry(
             state, obs, gstate, rms_init(self.env.norm_dim), guide_state,
-            _episode_stats_init(E), jnp.float32(0.1),
+            _episode_stats_init(E), jnp.float32(0.0), jnp.float32(0.0),
         )
 
     def run(self, actor_params, critic_params, carry: GuidedCarry, num_steps: int, key: jax.Array):
@@ -550,9 +553,11 @@ def train(config_path: str, save_dir: str, resume: str | None,
         lr_a = linear_lr_decay(lr_actor_0,  update, total_updates) if lr_decay else lr_actor_0
         lr_c = linear_lr_decay(lr_critic_0, update, total_updates) if lr_decay else lr_critic_0
 
-        human_prob = jnp.clip(1.0 - carry.smoothed_col_rate / 0.1, 0.0, 1.0)
-        carry = carry._replace(env_state=vec_env.update_human_stop_prob(
-            carry.env_state, jnp.full((E,), human_prob, dtype=jnp.float32)
+        ghost_prob = ghost_robot_probability(
+            carry.smoothed_col_rate, carry.smoothed_coverage_rate
+        )
+        carry = carry._replace(env_state=vec_env.update_ghost_robot_prob(
+            carry.env_state, jnp.full((E,), ghost_prob, dtype=jnp.float32)
         ))
 
         key, rollout_key = jax.random.split(key)
@@ -562,7 +567,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
         )
         total_col_rate = jnp.mean(traj.wall_hit) + jnp.mean(traj.robot_hit)
         carry = carry._replace(
-            smoothed_col_rate=0.9 * carry.smoothed_col_rate + 0.1 * total_col_rate
+            smoothed_col_rate=0.9 * carry.smoothed_col_rate + 0.1 * total_col_rate,
+            smoothed_coverage_rate=(
+                0.9 * carry.smoothed_coverage_rate + 0.1 * jnp.mean(traj.coverage)
+            ),
         )
         if not normalize_obs:
             carry = carry._replace(rms=prev_rms)

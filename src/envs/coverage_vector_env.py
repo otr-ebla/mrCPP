@@ -40,7 +40,7 @@ class EnvState:
     wall_hits:        jax.Array   # (N,)     float32  — 0.0 / 1.0
     robot_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
     human_hits:       jax.Array   # (N,)     float32  — 0.0 / 1.0
-    human_stop_prob:  jax.Array   # ()       float32
+    ghost_robot_prob: jax.Array   # ()       float32 — humans ignore robots with this probability
 
 
 @struct.dataclass
@@ -95,6 +95,9 @@ class MultiRobotCoverageEnv:
                 f"reward weights must be non-negative: {', '.join(negative)}"
             )
         self._safe_dist = float(cfg.get('safe_dist_factor', 5.0)) * self.robot_radius
+        self.human_robot_stop_distance = float(
+            cfg.get('human_robot_stop_distance', self._safe_dist)
+        )
         self.room_completion_bonus     = float(cfg.get('room_completion_bonus',     50.0))
         self.room_completion_threshold = float(cfg.get('room_completion_threshold', 0.85))
         self.completion_bonus          = float(cfg.get('completion_bonus',         200.0))
@@ -227,6 +230,26 @@ class MultiRobotCoverageEnv:
         d2 = jnp.sum(diff * diff, axis=-1)
         n = pos.shape[0]
         return d2 + jnp.eye(n, dtype=d2.dtype) * _BIG
+
+    def _robot_human_surface_distance(
+        self, robot_pos: jax.Array, human_pos: jax.Array, human_hdg: jax.Array
+    ) -> jax.Array:
+        """Signed edge-to-edge distance for circular robots and elliptical humans."""
+        delta = robot_pos[:, None, :] - human_pos[None, :, :]
+        center_dist = jnp.linalg.norm(delta, axis=-1)
+        direction = delta / jnp.maximum(center_dist[..., None], 1e-8)
+
+        c = jnp.cos(human_hdg)[None, :]
+        s = jnp.sin(human_hdg)[None, :]
+        along = direction[..., 0] * c + direction[..., 1] * s
+        across = -direction[..., 0] * s + direction[..., 1] * c
+
+        semi_along = self.robot_radius * 0.6
+        semi_across = self.robot_radius * 1.2
+        human_edge_radius = (semi_along * semi_across) / jnp.sqrt(
+            (semi_across * along) ** 2 + (semi_along * across) ** 2
+        )
+        return center_dist - self.robot_radius - human_edge_radius
 
     def _pos_to_cell(self, pos: jax.Array) -> tuple[jax.Array, jax.Array]:
         col = jnp.clip(jnp.floor(pos[:, 0] / self.cell_size), 0, self.grid_w - 1)
@@ -380,7 +403,9 @@ class MultiRobotCoverageEnv:
             wall_hits        = jnp.zeros((self.num_robots,), jnp.float32),
             robot_hits       = jnp.zeros((self.num_robots,), jnp.float32),
             human_hits       = jnp.zeros((self.num_robots,), jnp.float32),
-            human_stop_prob  = jnp.float32(0.0),
+            # Evaluation is safe by default: humans always react to robots.
+            # Training explicitly overrides this value with its curriculum.
+            ghost_robot_prob = jnp.float32(0.0),
         )
 
     def step(
@@ -405,7 +430,7 @@ class MultiRobotCoverageEnv:
         close    = (d2 < (2.0 * self.robot_radius) ** 2) & pair_ok
         robot_hit = jnp.any(close, axis=1) & alive
 
-        key, h_hdg_key, h_dist_key, h_stop_key = jax.random.split(state.key, 4)
+        key, h_hdg_key, h_dist_key, ghost_key = jax.random.split(state.key, 4)
         if self.num_humans > 0:
             h_v = 0.5
             dist_step = h_v * self.dt
@@ -423,23 +448,39 @@ class MultiRobotCoverageEnv:
             final_h_headings = jnp.where(need_new, new_headings, state.human_headings)
             final_h_dists = jnp.where(need_new, new_dists, new_h_dists)
             
-            new_human_pos = jnp.where(h_wall_hit[:, None], state.human_positions, h_cand_pos)
+            # A non-ghost robot is a dynamic obstacle for a human.  Humans are
+            # deliberately simple: they stop instead of planning a detour.
+            # Sampling per human avoids making the whole crowd ghost at once.
+            diff_hr = h_cand_pos[:, None, :] - next_pos[None, :, :]
+            robot_near = jnp.any(
+                jnp.sum(diff_hr * diff_hr, axis=-1)
+                < self.human_robot_stop_distance ** 2,
+                axis=1,
+            )
+            robot_is_ghost = jax.random.uniform(
+                ghost_key, (self.num_humans,)
+            ) < state.ghost_robot_prob
+            human_stops = robot_near & ~robot_is_ghost
 
-            diff_rh = next_pos[:, None, :] - new_human_pos[None, :, :]
-            d2_rh = jnp.sum(diff_rh * diff_rh, axis=-1)
-            robot_hit_human = jnp.any(d2_rh < (2.0 * self.robot_radius) ** 2, axis=1) & alive
+            new_human_pos = jnp.where(
+                (h_wall_hit | human_stops)[:, None],
+                state.human_positions,
+                h_cand_pos,
+            )
+
+            surface_distance = self._robot_human_surface_distance(
+                next_pos, new_human_pos, final_h_headings
+            )
+            # Contact counts: zero clearance means the two body edges touch.
+            robot_hit_human = jnp.any(surface_distance <= 0.0, axis=1) & alive
         else:
             new_human_pos = state.human_positions
             final_h_headings = state.human_headings
             final_h_dists = state.human_dists
             robot_hit_human = jnp.zeros((self.num_robots,), dtype=bool)
 
-        terminate_on_human = jax.random.uniform(h_stop_key) < state.human_stop_prob
-        human_collision = robot_hit_human & alive
-        human_terminated = jnp.any(human_collision) & terminate_on_human
-        
         collided = (wall_hit | robot_hit | robot_hit_human) & alive
-        alive_next = alive & ~collided if self.terminate_on_collision else jnp.where(terminate_on_human, alive & ~human_collision, alive)
+        alive_next = alive & ~collided if self.terminate_on_collision else alive
 
         moved   = alive & ~collided
         new_pos = jnp.where(moved[:, None], next_pos, state.robot_positions)
@@ -500,7 +541,7 @@ class MultiRobotCoverageEnv:
 
         step_count = state.step_count + 1
         truncated  = step_count >= self.max_steps
-        terminated = complete | human_terminated | (jnp.any(collided) if self.terminate_on_collision else jnp.bool_(False))
+        terminated = complete | (jnp.any(collided) if self.terminate_on_collision else jnp.bool_(False))
 
         next_state = state.replace(
             robot_positions  = new_pos,
@@ -520,8 +561,8 @@ class MultiRobotCoverageEnv:
         )
         return next_state, rewards, terminated, truncated
 
-    def set_human_stop_prob(self, state: EnvState, prob: jax.Array) -> EnvState:
-        return state.replace(human_stop_prob=prob)
+    def set_ghost_robot_prob(self, state: EnvState, prob: jax.Array) -> EnvState:
+        return state.replace(ghost_robot_prob=jnp.clip(prob, 0.0, 1.0))
 
     def set_bosco_targets(self, state: EnvState, bosco_targets: jax.Array) -> EnvState:
         """Update BOSCO targets. bosco_targets: (N, 2)"""
