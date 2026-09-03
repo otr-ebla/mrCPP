@@ -41,6 +41,9 @@ from flax.training.train_state import TrainState
 from src.utils.jax_device import init_device as _pick_init_device
 
 _LOG_2PI = float(np.log(2.0 * np.pi))
+_GH_NODES, _GH_WEIGHTS = (
+    tuple(x.tolist()) for x in np.polynomial.hermite.hermgauss(8)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,18 @@ def _tanh_normal_log_prob(
     log_prob = -0.5 * ((z - mean) / std) ** 2 - jnp.log(std) - 0.5 * _LOG_2PI
     log_prob = log_prob - jnp.log(1.0 - action ** 2 + 1e-6)
     return jnp.sum(log_prob, axis=-1)
+
+
+def _tanh_normal_entropy(mean: jax.Array, std: jax.Array) -> jax.Array:
+    """Differentiable entropy of tanh(N(mean, std)) via Gauss-Hermite quadrature."""
+    nodes = jnp.asarray(_GH_NODES, dtype=mean.dtype)
+    weights = jnp.asarray(_GH_WEIGHTS, dtype=mean.dtype) / jnp.sqrt(jnp.pi)
+    z = mean[..., None] + jnp.sqrt(2.0) * std[..., None] * nodes
+    # log(1 - tanh(z)^2), written without forming a saturated tanh.
+    log_jacobian = 2.0 * (jnp.log(2.0) - z - jax.nn.softplus(-2.0 * z))
+    expected_log_jacobian = jnp.sum(log_jacobian * weights, axis=-1)
+    normal_entropy = jnp.log(std) + 0.5 * (1.0 + _LOG_2PI)
+    return jnp.sum(normal_entropy + expected_log_jacobian, axis=-1)
 
 
 @jax.jit
@@ -411,16 +426,11 @@ class MAPPO:
             surr2 = jnp.clip(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_f
             loss = -jnp.mean(jnp.minimum(surr1, surr2))
 
-            # Entropy of the SQUASHED policy, estimated as -E[log pi(a)] on the
-            # rollout samples. The Gaussian entropy alone, sum(0.5*log(2*pi*e)
-            # + log_std), is linear and unbounded in log_std: its gradient is a
-            # constant -entropy_coef push towards a wider sigma that nothing
-            # balances once tanh saturates and the surrogate stops caring about
-            # z. That is what made the logged entropy climb monotonically while
-            # coverage collapsed. The Jacobian term, sum(log(1 - a^2)), diverges
-            # to -inf as the actions saturate, so this estimate is self-limiting:
-            # widening sigma past the useful range now *costs* entropy.
-            entropy = jnp.mean(-log_prob)
+            # This must be evaluated under the *current* policy. Reusing fixed
+            # rollout samples gives a cross-entropy gradient which incorrectly
+            # drives std upward. Quadrature keeps the tanh Jacobian differentiable
+            # and makes the bonus actively pull saturated actions back inward.
+            entropy = jnp.mean(_tanh_normal_entropy(mean, std))
             return loss - self.entropy_coef * entropy, (loss, entropy, jnp.mean(std))
 
         def critic_loss_fn(params):

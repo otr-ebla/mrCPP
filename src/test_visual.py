@@ -404,6 +404,7 @@ class MappoController:
                     env.cell_size,
                     free_cells=graph_free,
                     graph_components=graph_components,
+                    previous_coverage_grid=state.coverage_grid[None],
                 )
                 valid = waypoint[0] >= 0
                 safe = jnp.maximum(waypoint[0], 0)

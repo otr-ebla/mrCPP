@@ -81,7 +81,7 @@ model:
 train:
   num_envs: 8            # parallel environment workers (set to your CPU core count)
   rollout_steps: 256     # T — steps per env per update; total = num_envs × T
-  total_updates: 2500    # includes ~1000 safety fine-tuning updates with humans
+  total_updates: 4470    # update 1970 + 2500 safety fine-tuning updates with humans
   log_interval: 10       # print every N updates
   save_interval: 100     # save checkpoint every N updates
   gamma: 0.99

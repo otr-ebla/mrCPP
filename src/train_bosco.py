@@ -133,6 +133,14 @@ def _trunk_key(params, in_dim: int) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def _tree_shapes_match(a, b) -> bool:
+    a_leaves, a_tree = jax.tree_util.tree_flatten(a)
+    b_leaves, b_tree = jax.tree_util.tree_flatten(b)
+    return (a_tree == b_tree and len(a_leaves) == len(b_leaves)
+            and all(np.shape(x) == np.shape(y)
+                    for x, y in zip(a_leaves, b_leaves)))
+
+
 def load_checkpoint(path: str, actor_state, critic_state, device,
                     trunk_in: int) -> tuple[object, object, RunningMeanStd, int]:
     with open(path, 'rb') as f:
@@ -150,10 +158,17 @@ def load_checkpoint(path: str, actor_state, critic_state, device,
         params=params,
         opt_state=jax.device_put(ckpt['actor_opt'], device),
     )
-    critic_state = critic_state.replace(
-        params=jax.device_put(ckpt['critic_params'], device),
-        opt_state=jax.device_put(ckpt['critic_opt'], device),
-    )
+    if _tree_shapes_match(critic_state.params, ckpt['critic_params']):
+        critic_state = critic_state.replace(
+            params=jax.device_put(ckpt['critic_params'], device),
+            opt_state=jax.device_put(ckpt['critic_opt'], device),
+        )
+    else:
+        print(
+            "Checkpoint critic shape differs from the current environment "
+            "(for example, the number of humans changed): keeping a freshly "
+            "initialised critic while transferring the actor."
+        )
     rms = RunningMeanStd(*jax.device_put(tuple(ckpt['obs_rms']), device))
     return actor_state, critic_state, rms, int(ckpt['update'])
 
@@ -324,6 +339,7 @@ class GuidedRollout:
                     vec_env.env.cell_size,
                     free_cells=self.graph_free,
                     graph_components=self.graph_components,
+                    previous_coverage_grid=state.coverage_grid,
                 )
                 
                 valid = waypoint >= 0
@@ -440,11 +456,12 @@ class GuidedRollout:
 # interchangeable — a guided actor rejects a bare environment observation — so
 # writing both to `checkpoint_final.pkl` would silently destroy the baseline.
 CHECKPOINT_NAME = 'checkpoint_bosco.pkl'
+LATEST_CHECKPOINT_NAME = 'checkpoint_bosco_latest.pkl'
 LOG_NAME        = 'training_log_bosco.csv'
 
 
 def train(config_path: str, save_dir: str, resume: str | None,
-          backend: str | None = None, guide_bonus: float = 2.0,
+          backend: str | None = None, guide_bonus: float = 10.0,
           wandb_overrides: dict | None = None, num_humans: int = 0,
           num_envs: int | None = None):
     config = load_config(config_path)
@@ -462,6 +479,12 @@ def train(config_path: str, save_dir: str, resume: str | None,
 
     vec_env    = VecEnv(train_cfg.get('num_envs', 4), env_cfg)
     env        = vec_env.env
+    if env.num_maps != 1:
+        raise ValueError(
+            "BOSCO-guided training currently requires env.num_maps=1: the "
+            "accelerator rollout shares one traversability graph across all "
+            "environments. Multiple maps would produce invalid waypoints."
+        )
     E          = vec_env.E
     N          = vec_env.num_robots
     action_dim = vec_env.action_dim
@@ -568,7 +591,7 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'guide_hits_per_episode', 'guide_hit_rate',
                                 'actor_loss', 'critic_loss', 'entropy', 'std'])
 
-    best_mean_reward = -np.inf
+    best_policy_score = None
 
     for update in range(start_update, total_updates + 1):
         lr_a = linear_lr_decay(lr_actor_0,  update, total_updates) if lr_decay else lr_actor_0
@@ -586,7 +609,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
         carry, traj, last_value, hits = rollout.run(
             actor_state.params, critic_state.params, carry, T, rollout_key
         )
-        total_col_rate = jnp.mean(traj.wall_hit) + jnp.mean(traj.robot_hit)
+        total_col_rate = (jnp.mean(traj.wall_hit)
+                          + jnp.mean(traj.robot_hit)
+                          + jnp.mean(traj.human_hit))
         carry = carry._replace(
             smoothed_col_rate=0.9 * carry.smoothed_col_rate + 0.1 * total_col_rate,
             smoothed_coverage_rate=(
@@ -656,7 +681,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 f"Update {update:5d}/{total_updates} | "
                 f"episodes={ep_count:6d} | "
                 f"mean_ep_r={mean_ep_r:8.3f} | "
-                f"success={mean_ep_cov:6.2%} | "
+                f"ep_cov={mean_ep_cov:6.2%} | "
+                f"complete={completion_rate:6.2%} | "
                 f"coverage={last_cov:.2%} | "
                 f"guide={guide_rate:6.2%} | "
                 f"actor={float(losses['actor_loss']):7.4f} | "
@@ -717,17 +743,32 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'lr/actor':                       lr_a,
                     'lr/critic':                      lr_c,
                 }, step=update)
-            if ep_count > 0 and mean_ep_r > best_mean_reward:
-                best_mean_reward = mean_ep_r
+            # Prefer deployable behaviour: task completion first, then coverage,
+            # then fewer contacts. The raw reward alone can select a fast policy
+            # that repeatedly bumps a wall and still finishes the map.
+            policy_score = (
+                completion_rate,
+                -(ep_wall_mean + ep_robot_mean + ep_human_mean),
+                mean_ep_cov,
+                mean_ep_r,
+            )
+            if ep_count > 0 and (
+                best_policy_score is None or policy_score > best_policy_score
+            ):
+                best_policy_score = policy_score
                 save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
                                 update, actor_state, critic_state, carry.rms,
                                 tail_dim, guide_bonus)
-                print(f"  → best policy saved (mean_ep_r={mean_ep_r:.3f})")
+                print(
+                    f"  → best policy saved (complete={completion_rate:.2%}, "
+                    f"coverage={mean_ep_cov:.2%}, contacts/ep="
+                    f"{ep_wall_mean + ep_robot_mean + ep_human_mean:.2f})"
+                )
                 if run is not None:
                     run.summary['best_mean_ep_reward'] = mean_ep_r
                     run.summary['best_update'] = update
 
-    save_checkpoint(os.path.join(save_dir, CHECKPOINT_NAME),
+    save_checkpoint(os.path.join(save_dir, LATEST_CHECKPOINT_NAME),
                     total_updates, actor_state, critic_state, carry.rms,
                     tail_dim, guide_bonus)
     if run is not None:
@@ -749,7 +790,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume',   default=None,
                         help='Checkpoint to resume from; a non-guided actor '
                              '(src.pretrain_bc / src.train_simple) is widened')
-    parser.add_argument('--guide-bonus', type=float, default=2.0,
+    parser.add_argument('--guide-bonus', type=float, default=10.0,
                         help='Reward paid to a robot that enters the cell BOSCO '
                              'pointed it at. Keep it below the environment\'s '
                              'alpha (10.0): the waypoint is usually an '

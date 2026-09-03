@@ -192,7 +192,8 @@ def advance_cursors(tours, tour_lens, idx, cell, covered, snap_window=8):
 
 def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done,
                    graph_neighbors, w, h, cell_size, guides=None,
-                   free_cells=None, graph_components=None, revisit_penalty=0.5):
+                   free_cells=None, graph_components=None, revisit_penalty=0.5,
+                   previous_coverage_grid=None):
     """Advance the fixed sweep and emit a reactive one-cell waypoint.
 
     The remaining sweep is retained after a deviation, while its shortest-path
@@ -223,17 +224,31 @@ def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done,
     cell = row * w + col
     
     covered = (coverage_grid > 0.5).reshape(E, C)
+    previous_covered = (
+        covered if previous_coverage_grid is None
+        else (previous_coverage_grid > 0.5).reshape(E, C)
+    )
+
+    e_idx = jnp.arange(E)[:, None]
+    valid_target = state.target >= 0
+    safe_target = jnp.maximum(state.target, 0)
+    target_covered = valid_target & covered[e_idx, safe_target]
+    target_newly_covered = (
+        target_covered & ~previous_covered[e_idx, safe_target]
+    )
+
+    # The arrival bonus represents coverage, not mere occupancy.  Likewise a
+    # waypoint stays stable until its cell has actually been covered; otherwise
+    # a robot that only enters/approaches a cell can receive a new objective.
+    reached = (~done[:, None]) & (cell == state.target) & target_newly_covered
+    can_advance = done[:, None] | ~valid_target | target_covered
     
-    reached = (state.target >= 0) & (cell == state.target)
-    
-    # Only advance if cell changed or stale (fail_cov != n_covered)
-    # To keep JAX simple and avoid conditional branching across all, we just advance always.
-    # It's fast anyway.
+    # Derive candidates in parallel, then retain the previous per-robot guide
+    # state wherever ``can_advance`` is false.
     new_idx = advance_cursors(state.tours, state.tour_lens, state.idx, cell, covered)
     
     is_finished = new_idx >= state.tour_lens
     
-    e_idx = jnp.arange(E)[:, None]
     n_idx = jnp.arange(N)[None, :]
     safe_idx = jnp.minimum(new_idx, state.tour_lens - 1)
     tour_target = state.tours[e_idx, n_idx, safe_idx]
@@ -262,11 +277,12 @@ def jax_guide_step(state: JaxGuideState, positions, coverage_grid, done,
     n_covered = jnp.sum(covered, axis=-1, dtype=jnp.int32)
     fail_cov = jnp.where(waypoint < 0, n_covered[:, None], -1)
     
+    waypoint = jnp.where(can_advance, waypoint, state.target)
     new_state = state._replace(
         target=waypoint,
-        prev_cell=cell,
-        fail_cov=fail_cov,
-        idx=new_idx,
+        prev_cell=jnp.where(can_advance, cell, state.prev_cell),
+        fail_cov=jnp.where(can_advance, fail_cov, state.fail_cov),
+        idx=jnp.where(can_advance, new_idx, state.idx),
     )
     
     return new_state, waypoint, reached

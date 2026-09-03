@@ -85,22 +85,30 @@ class MultiRobotCoverageEnv:
         self.coverage_reward_growth = float(
             cfg.get('coverage_reward_growth', 2.0)
         )
-        self.bosco_gamma = float(cfg.get('bosco_gamma',  5.0))
+        self.bosco_gamma = float(cfg.get('bosco_gamma', 10.0))
+        self.bosco_distance_penalty = float(
+            cfg.get('bosco_distance_penalty', 1.0)
+        )
         self.beta        = float(cfg.get('beta',         0.5))
         self.kappa       = float(cfg.get('kappa',        5.0))
+        self.wall_kappa  = float(cfg.get('wall_kappa', self.kappa))
+        self.human_kappa = float(cfg.get('human_kappa', self.kappa))
         self.tau         = float(cfg.get('tau',          0.05))
         self.psi         = float(cfg.get('psi',          2.0))
-        self.velocity_cost = float(cfg.get('velocity_cost', 0.08))
-        self.angular_cost = float(cfg.get('angular_cost', 0.05))
+        self.velocity_cost = float(cfg.get('velocity_cost', 0.05))
+        self.angular_cost = float(cfg.get('angular_cost', 0.01))
         self.action_smoothness_cost = float(
-            cfg.get('action_smoothness_cost', 0.05)
+            cfg.get('action_smoothness_cost', 0.01)
         )
         weights = {
             'alpha': self.alpha,
             'coverage_reward_growth': self.coverage_reward_growth,
             'bosco_gamma': self.bosco_gamma,
+            'bosco_distance_penalty': self.bosco_distance_penalty,
             'beta': self.beta,
             'kappa': self.kappa,
+            'wall_kappa': self.wall_kappa,
+            'human_kappa': self.human_kappa,
             'tau': self.tau,
             'psi': self.psi,
             'velocity_cost': self.velocity_cost,
@@ -569,6 +577,12 @@ class MultiRobotCoverageEnv:
         dist_to_bosco_prev = jnp.sqrt(jnp.sum((state.robot_positions - state.bosco_targets)**2, axis=-1))
         dist_to_bosco_next = jnp.sqrt(jnp.sum((new_pos - state.bosco_targets)**2, axis=-1))
         bosco_reward_term = self.bosco_gamma * (dist_to_bosco_prev - dist_to_bosco_next)
+        bosco_active = jnp.any(state.cell_assignments > 0.5, axis=(1, 2))
+        bosco_distance_cost = (
+            self.bosco_distance_penalty
+            * (dist_to_bosco_next / self.cell_size) ** 2
+            * bosco_active
+        )
 
         v_norm = v_cmds / self.v_max
         omega_norm = omega_cmds / self.omega_max
@@ -588,10 +602,13 @@ class MultiRobotCoverageEnv:
             + (self.alpha * 0.25) * discovery_multiplier * unassigned_discovery
             - self.beta * redundant_travel
             - self.tau
-            - self.kappa * collided
+            - self.wall_kappa * wall_hit
+            - self.kappa * robot_hit
+            - self.human_kappa * robot_hit_human
             - prox_pen
             + team_bonus
             + bosco_reward_term
+            - bosco_distance_cost
             - control_cost,
             0.0,
         ).astype(jnp.float32)

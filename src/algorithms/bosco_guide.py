@@ -92,6 +92,7 @@ class BoscoGuide(BoscoExpert):
         # Team coverage count at the last update that found nothing to do. A
         # robot with no target only retries once the map has actually changed.
         self._fail_cov = np.full(n, -1, dtype=np.int64)
+        self._covered = np.zeros_like(self.graph.free, dtype=bool)
         return info
 
     # -- per-step guidance --------------------------------------------------
@@ -108,15 +109,18 @@ class BoscoGuide(BoscoExpert):
         covered = np.asarray(coverage_grid, dtype=np.float32).ravel() > 0.5
         cur = self.graph.cell_of(pos).astype(np.int64)
 
-        # The cursor invariant guarantees target != the cell the robot was in, so
-        # an arrival is always a real cell transition.
-        reached = (self.target >= 0) & (cur == self.target)
+        valid_target = self.target >= 0
+        safe_target = np.maximum(self.target, 0)
+        target_covered = valid_target & covered[safe_target]
+        target_newly_covered = target_covered & ~self._covered[safe_target]
+        reached = valid_target & (cur == self.target) & target_newly_covered
 
         n_covered = int(covered.sum())
         stale = (self.target < 0) & (self._fail_cov != n_covered)
-        for r in np.flatnonzero((cur != self._prev_cell) | stale):
+        for r in np.flatnonzero(target_covered | stale):
             self._advance(int(r), int(cur[r]), covered, pos, n_covered)
         self._prev_cell = cur
+        self._covered = covered.copy()
         return self.target.copy(), reached
 
     # -- helpers ------------------------------------------------------------

@@ -71,10 +71,87 @@ def test_finished_tour_stops_when_every_free_cell_is_covered():
     assert waypoint.tolist() == [[-1]]
 
 
+def test_target_and_reward_wait_until_target_cell_is_covered():
+    state = JaxGuideState(
+        target=jnp.asarray([[1]], dtype=jnp.int32),
+        prev_cell=jnp.asarray([[0]], dtype=jnp.int32),
+        fail_cov=jnp.asarray([[-1]], dtype=jnp.int32),
+        idx=jnp.asarray([[1]], dtype=jnp.int32),
+        tours=jnp.asarray([[[0, 1, 2]]], dtype=jnp.int32),
+        tour_lens=jnp.asarray([[3]], dtype=jnp.int32),
+    )
+    previous = jnp.asarray([[[1.0, 0.0, 0.0]]], dtype=jnp.float32)
+
+    waiting_state, waiting_waypoint, waiting_reward = jax_guide_step(
+        state,
+        positions=jnp.asarray([[[0.5, 0.5]]], dtype=jnp.float32),
+        coverage_grid=previous,
+        done=jnp.asarray([False]),
+        graph_neighbors=_line_neighbors(3),
+        w=3,
+        h=1,
+        cell_size=1.0,
+        free_cells=jnp.ones((3,), dtype=jnp.bool_),
+        graph_components=jnp.zeros((3,), dtype=jnp.int32),
+        previous_coverage_grid=previous,
+    )
+
+    assert waiting_waypoint.tolist() == [[1]]
+    assert waiting_state.idx.tolist() == [[1]]
+    assert waiting_reward.tolist() == [[False]]
+
+    covered = previous.at[0, 0, 1].set(1.0)
+    advanced_state, advanced_waypoint, coverage_reward = jax_guide_step(
+        waiting_state,
+        positions=jnp.asarray([[[1.5, 0.5]]], dtype=jnp.float32),
+        coverage_grid=covered,
+        done=jnp.asarray([False]),
+        graph_neighbors=_line_neighbors(3),
+        w=3,
+        h=1,
+        cell_size=1.0,
+        free_cells=jnp.ones((3,), dtype=jnp.bool_),
+        graph_components=jnp.zeros((3,), dtype=jnp.int32),
+        previous_coverage_grid=previous,
+    )
+
+    assert coverage_reward.tolist() == [[True]]
+    assert advanced_waypoint.tolist() == [[2]]
+    assert advanced_state.idx.tolist() == [[2]]
+
+
+def test_entering_an_already_covered_target_does_not_pay_coverage_reward():
+    state = JaxGuideState(
+        target=jnp.asarray([[1]], dtype=jnp.int32),
+        prev_cell=jnp.asarray([[0]], dtype=jnp.int32),
+        fail_cov=jnp.asarray([[-1]], dtype=jnp.int32),
+        idx=jnp.asarray([[1]], dtype=jnp.int32),
+        tours=jnp.asarray([[[0, 1, 2]]], dtype=jnp.int32),
+        tour_lens=jnp.asarray([[3]], dtype=jnp.int32),
+    )
+    covered = jnp.asarray([[[1.0, 1.0, 0.0]]], dtype=jnp.float32)
+
+    _, _, coverage_reward = jax_guide_step(
+        state,
+        positions=jnp.asarray([[[1.5, 0.5]]], dtype=jnp.float32),
+        coverage_grid=covered,
+        done=jnp.asarray([False]),
+        graph_neighbors=_line_neighbors(3),
+        w=3,
+        h=1,
+        cell_size=1.0,
+        free_cells=jnp.ones((3,), dtype=jnp.bool_),
+        graph_components=jnp.zeros((3,), dtype=jnp.int32),
+        previous_coverage_grid=covered,
+    )
+
+    assert coverage_reward.tolist() == [[False]]
+
+
 def test_mopup_ignores_closer_uncovered_cell_in_an_unreachable_component():
     tours = jnp.full((1, 1, 5), -1, dtype=jnp.int32).at[0, 0, 0].set(0)
     state = JaxGuideState(
-        target=jnp.asarray([[1]], dtype=jnp.int32),
+        target=jnp.asarray([[0]], dtype=jnp.int32),
         prev_cell=jnp.asarray([[0]], dtype=jnp.int32),
         fail_cov=jnp.asarray([[-1]], dtype=jnp.int32),
         idx=jnp.asarray([[1]], dtype=jnp.int32),

@@ -15,18 +15,22 @@ def test_baseline_reward_weights_are_loaded_by_the_environment():
     config = load_config(CONFIG)
     env_config = config["env"]
 
+    assert env_config["num_maps"] == 1
     assert env_config["alpha"] == 10.0
     assert env_config["coverage_reward_growth"] == 2.0
     assert env_config["beta"] == 0.5
-    assert env_config["kappa"] == 25.0
+    assert env_config["kappa"] == 50.0
+    assert env_config["wall_kappa"] == 30.0
+    assert env_config["human_kappa"] == 150.0
     assert env_config["tau"] == 0.05
     assert env_config["psi"] == 2.0
-    assert env_config["bosco_gamma"] == 5.0
+    assert env_config["bosco_gamma"] == 10.0
+    assert env_config["bosco_distance_penalty"] == 1.0
     assert env_config["terminate_on_collision"] is False
     assert env_config["safe_dist_factor"] == 3.0
-    assert env_config["velocity_cost"] == 0.08
-    assert env_config["angular_cost"] == 0.05
-    assert env_config["action_smoothness_cost"] == 0.05
+    assert env_config["velocity_cost"] == 0.05
+    assert env_config["angular_cost"] == 0.01
+    assert env_config["action_smoothness_cost"] == 0.01
     assert "bosco_gamma" not in config["wandb"]
 
 
@@ -39,6 +43,43 @@ def test_redundancy_may_be_penalised_more_than_elapsed_time():
 def test_negative_reward_weight_is_rejected():
     with pytest.raises(ValueError, match="reward weights must be non-negative: beta"):
         MultiRobotCoverageEnv({"beta": -0.1, "num_maps": 1})
+
+
+def test_bosco_distance_penalty_grows_quadratically():
+    env = MultiRobotCoverageEnv({
+        "num_robots": 1,
+        "num_maps": 1,
+        "alpha": 0.0,
+        "beta": 0.0,
+        "tau": 0.0,
+        "bosco_gamma": 0.0,
+        "bosco_distance_penalty": 1.0,
+        "velocity_cost": 0.0,
+        "angular_cost": 0.0,
+        "action_smoothness_cost": 0.0,
+        "room_completion_threshold": 2.0,
+        "room_completion_bonus": 0.0,
+        "completion_bonus": 0.0,
+    })
+    state = env.reset(jax.random.PRNGKey(7))
+    cols, rows = env._pos_to_cell(state.robot_positions)
+    state = state.replace(
+        coverage_grid=state.coverage_grid.at[rows[0], cols[0]].set(1.0),
+        cell_assignments=state.cell_assignments.at[0, rows[0], cols[0]].set(1.0),
+    )
+    action = jnp.asarray([[-1.0, 0.0]], jnp.float32)
+    near_target = state.robot_positions + jnp.asarray([[env.cell_size, 0.0]])
+    far_target = state.robot_positions + jnp.asarray([[2.0 * env.cell_size, 0.0]])
+
+    _, near_reward, _, _ = env.step(
+        state.replace(bosco_targets=near_target), action
+    )
+    _, far_reward, _, _ = env.step(
+        state.replace(bosco_targets=far_target), action
+    )
+
+    assert near_reward[0] == pytest.approx(-1.0)
+    assert far_reward[0] == pytest.approx(-4.0)
 
 
 def test_actor_observation_contains_binary_local_coverage_patch():
