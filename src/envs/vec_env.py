@@ -50,6 +50,7 @@ class VecEnv:
         self.reset = jax.jit(self._reset)
         self.step = jax.jit(self._step)
         self.update_bosco = jax.jit(self._update_bosco)
+        self.update_cell_assignments = jax.jit(self._update_cell_assignments)
         self.update_ghost_robot_prob = jax.jit(self._update_ghost_robot_prob)
 
     @property
@@ -130,7 +131,9 @@ class VecEnv:
             info = self.env.get_info(s)
 
             key, reset_key = jax.random.split(s.key)
-            fresh = self.env.reset(reset_key)
+            fresh = self.env.reset(reset_key).replace(
+                cell_assignments=s.cell_assignments
+            )
             s = jax.tree_util.tree_map(
                 lambda f, c: _select(done, f, c), fresh, s.replace(key=key)
             )
@@ -151,3 +154,9 @@ class VecEnv:
             s_new = self.env.set_bosco_targets(s, t)
             return s_new, self.env.get_obs(s_new), self.env.get_global_state(s_new)
         return jax.vmap(one)(state, targets)
+
+    def _update_cell_assignments(self, state: EnvState, assignments: jax.Array):
+        def one(s: EnvState, a: jax.Array):
+            s_new = self.env.set_cell_assignments(s, a)
+            return s_new, self.env.get_obs(s_new), self.env.get_global_state(s_new)
+        return jax.vmap(one)(state, assignments)

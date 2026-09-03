@@ -14,31 +14,45 @@ env:
   # cells each × 5 = ~505 steps for a *perfect* sweep with zero overlap and no
   # turning. 500 was therefore the exact theoretical minimum, i.e. unreachable
   # in practice; 2000 leaves 4× slack so full coverage is physically possible.
-  max_steps: 3000        # steps before truncation
+  max_steps: 4000        # steps before truncation
   v_max: 1.0             # max linear velocity (m/s); action[:,0] remapped [-1,1]→[0,v_max]
   omega_max: 1.0         # max angular velocity (rad/s)
-  # Hard collisions: a wall, robot or human collision ends the team episode.
-  # This keeps training and strict visual evaluation under the same dynamics.
-  terminate_on_collision: true
+  # Soft collisions: an attempted move into a wall, robot or human is rejected,
+  # the offender pays kappa, and the episode continues.  Making every contact
+  # terminal taught the policy to keep excessive clearance instead of learning
+  # how to recover from a close encounter.
+  terminate_on_collision: false
   # local coverage patch: gives actors a birds-eye view of nearby coverage without
   # breaking decentralised execution — this is the key driver of efficient coverage
   use_local_coverage_obs: true
   local_coverage_size: 5    # 5×5 = 25 binary cells centred on the robot
   # reward weights — difference reward: alpha, beta, kappa and psi are charged to
   # the individual robot, the two completion bonuses are the only shared terms
-  alpha: 10.0            # new cell discovered by THIS robot
+  # A discovery in the robot's BOSCO-assigned region earns alpha; discovering
+  # a new cell assigned to another robot (or not assigned) earns alpha / 4.
+  alpha: 10.0
+  # Linear growth of the new-cell reward with global coverage:
+  # multiplier = 1 + coverage_reward_growth * coverage_ratio.
+  # With 2.0, a discovery is worth 1x alpha at 0%, 2x at 50%, 3x near 100%.
+  coverage_reward_growth: 2.0
   # At v_max a robot takes about five steps to cross one cell. Four redundant
   # steps therefore cost 2.0, leaving new coverage strongly profitable while
   # making stationary/repetitive behaviour visible to the optimiser.
-  beta: 0.5              # no new cell this step (moving or stationary)
-  # A collision is both terminal and heavily penalised so its final transition
-  # produces a clear avoidance signal.
-  kappa: 80.0             # terminal collision penalty, charged to the offender
+  beta: 0.5              # distance travelled through already-covered cells
+  # Motion quality. Revisit cost is distance-based in the environment, so the
+  # same covered path costs the same at any speed. These small control costs
+  # discourage full-throttle, oscillatory motion without dominating coverage.
+  velocity_cost: 0.08
+  angular_cost: 0.05
+  action_smoothness_cost: 0.05
+  # A blocked move remains undesirable but is cheaper than a newly covered cell,
+  # so the policy can approach obstacles and recover instead of freezing early.
+  kappa: 25.0              # soft collision penalty, charged to the offender
   tau: 0.05              # small universal pressure to finish sooner
   # inter-robot proximity penalty: continuous soft repulsion before hard collision
   # fires when robots are within safe_dist_factor × robot_radius of each other
   psi: 2.0               # proximity penalty weight
-  safe_dist_factor: 5.0  # safe_dist = 5 × 0.20 m = 1.0 m
+  safe_dist_factor: 3.0  # 0.60 m centre distance: 0.20 m clearance at contact
   # Dense progress towards the current BOSCO waypoint. With a maximum 0.1 m
   # move per step this contributes at most about +0.5 per step.
   bosco_gamma: 5.0
@@ -59,7 +73,7 @@ model:
 train:
   num_envs: 8            # parallel environment workers (set to your CPU core count)
   rollout_steps: 256     # T — steps per env per update; total = num_envs × T
-  total_updates: 6000    # 3000 × 8 × 256 = 6.1M environment steps
+  total_updates: 1000    # 3000 × 8 × 256 = 6.1M environment steps
   log_interval: 10       # print every N updates
   save_interval: 100     # save checkpoint every N updates
   gamma: 0.99

@@ -31,6 +31,7 @@ class EnvState:
     human_headings:   jax.Array   # (M,)     float32
     human_dists:      jax.Array   # (M,)     float32
     bosco_targets:    jax.Array   # (N, 2)   float32  — target coordinates for BOSCO
+    cell_assignments: jax.Array   # (N, H, W) float32  — BOSCO ownership, one-hot
     coverage_grid:    jax.Array   # (H, W)   float32  — 0.0 / 1.0
     room_completed:   jax.Array   # (R,)     bool
     robot_alive:      jax.Array   # (N,)     bool
@@ -51,6 +52,7 @@ class GlobalState:
     kinematics:      jax.Array   # (N, 6)     float32, normalised
     human_positions: jax.Array   # (M, 2)     float32, normalised
     bosco_targets:   jax.Array   # (N, 2)     float32, normalised
+    cell_assignments: jax.Array  # (N, H, W)  float32, BOSCO ownership
     map_id:          jax.Array   # ()         int32
 
 
@@ -73,21 +75,37 @@ class MultiRobotCoverageEnv:
         self.v_max           = float(cfg.get('v_max',           1.0))
         self.omega_max       = float(cfg.get('omega_max',       1.0))
         self.terminate_on_collision = bool(cfg.get('terminate_on_collision', False))
+        self.use_local_coverage_obs = bool(cfg.get('use_local_coverage_obs', True))
+        self.local_coverage_size = int(cfg.get('local_coverage_size', 5))
+        if self.local_coverage_size <= 0 or self.local_coverage_size % 2 == 0:
+            raise ValueError("local_coverage_size must be a positive odd integer")
 
         # -- Reward weights --
         self.alpha       = float(cfg.get('alpha',       10.0))
+        self.coverage_reward_growth = float(
+            cfg.get('coverage_reward_growth', 2.0)
+        )
         self.bosco_gamma = float(cfg.get('bosco_gamma',  5.0))
         self.beta        = float(cfg.get('beta',         0.5))
         self.kappa       = float(cfg.get('kappa',        5.0))
         self.tau         = float(cfg.get('tau',          0.05))
         self.psi         = float(cfg.get('psi',          2.0))
+        self.velocity_cost = float(cfg.get('velocity_cost', 0.08))
+        self.angular_cost = float(cfg.get('angular_cost', 0.05))
+        self.action_smoothness_cost = float(
+            cfg.get('action_smoothness_cost', 0.05)
+        )
         weights = {
             'alpha': self.alpha,
+            'coverage_reward_growth': self.coverage_reward_growth,
             'bosco_gamma': self.bosco_gamma,
             'beta': self.beta,
             'kappa': self.kappa,
             'tau': self.tau,
             'psi': self.psi,
+            'velocity_cost': self.velocity_cost,
+            'angular_cost': self.angular_cost,
+            'action_smoothness_cost': self.action_smoothness_cost,
         }
         negative = [name for name, value in weights.items() if value < 0.0]
         if negative:
@@ -141,14 +159,24 @@ class MultiRobotCoverageEnv:
 
         # -- Derived dims --
         self.obs_vec_dim   = 2 + 2 + self.k_teammates * 2  # v, w, bosco_delta, teammates
-        self.patch_dim     = 0
+        self.patch_dim     = (
+            self.local_coverage_size ** 2 if self.use_local_coverage_obs else 0
+        )
         self.norm_dim      = self.obs_vec_dim + self.n_rays
-        self.obs_dim       = self.norm_dim
+        self.obs_dim       = self.norm_dim + self.patch_dim
         self.action_dim    = 2
-        self.critic_channels = 4
+        self.critic_channels = 6
         self.critic_vec_dim  = 6 + 6 * self.num_robots + 2 * self.num_humans + 2 * self.num_robots
         self._ray_angles = jnp.asarray(
             np.linspace(0.0, _TWO_PI, self.n_rays, endpoint=False, dtype=np.float32)
+        )
+        patch_axis = (
+            np.arange(self.local_coverage_size, dtype=np.float32)
+            - self.local_coverage_size // 2
+        ) * self.cell_size
+        patch_x, patch_y = np.meshgrid(patch_axis, patch_axis)
+        self._local_patch_offsets = jnp.asarray(
+            np.stack([patch_x, patch_y], axis=-1)
         )
 
         # -- Spawn candidates --
@@ -394,6 +422,9 @@ class MultiRobotCoverageEnv:
                 h_dist_key, (self.num_humans,), minval=0.5, maxval=5.0
             ),
             bosco_targets    = robot_positions,  # initialize target to current pos
+            cell_assignments = jnp.zeros(
+                (self.num_robots, self.grid_h, self.grid_w), jnp.float32
+            ),
             coverage_grid    = jnp.zeros((self.grid_h, self.grid_w), jnp.float32),
             room_completed   = jnp.zeros((self.num_rooms,), bool),
             robot_alive      = jnp.ones((self.num_robots,), bool),
@@ -502,7 +533,14 @@ class MultiRobotCoverageEnv:
             jnp.where(eligible, ids + 1, 0)
         )
         discovered = eligible & (claim[flat] == ids + 1)
+        assigned_discovery = discovered & (
+            state.cell_assignments[ids, rows, cols] > 0.5
+        )
+        unassigned_discovery = discovered & ~assigned_discovery
         redundant  = moved & ~discovered
+        travelled = jnp.linalg.norm(new_pos - state.robot_positions, axis=-1)
+        nominal_step = max(self.v_max * self.dt, 1e-6)
+        redundant_travel = redundant * travelled / nominal_step
 
         new_grid = prev_grid.at[rows, cols].max(
             jnp.where(moved & coverable, 1.0, 0.0)
@@ -515,6 +553,11 @@ class MultiRobotCoverageEnv:
         room_completed = state.room_completed | newly
 
         free_total = self.free_totals[state.map_id]
+        # Make late discoveries increasingly valuable.  Using the coverage
+        # before this step gives every simultaneous discovery the same weight
+        # and keeps the first cell worth exactly `alpha`.
+        coverage_before = jnp.sum(prev_grid) / jnp.maximum(free_total, 1.0)
+        discovery_multiplier = 1.0 + self.coverage_reward_growth * coverage_before
         complete   = jnp.sum(new_grid) >= free_total - 0.5
         team_bonus = (self.room_completion_bonus * jnp.sum(newly)
                       + self.completion_bonus * complete)
@@ -527,15 +570,29 @@ class MultiRobotCoverageEnv:
         dist_to_bosco_next = jnp.sqrt(jnp.sum((new_pos - state.bosco_targets)**2, axis=-1))
         bosco_reward_term = self.bosco_gamma * (dist_to_bosco_prev - dist_to_bosco_next)
 
+        v_norm = v_cmds / self.v_max
+        omega_norm = omega_cmds / self.omega_max
+        prev_v_norm = state.robot_velocities[:, 0] / self.v_max
+        prev_omega_norm = state.robot_velocities[:, 1] / self.omega_max
+        control_cost = (
+            self.velocity_cost * v_norm ** 2
+            + self.angular_cost * omega_norm ** 2
+            + self.action_smoothness_cost
+            * ((v_norm - prev_v_norm) ** 2
+               + (omega_norm - prev_omega_norm) ** 2)
+        )
+
         rewards = jnp.where(
             alive,
-            self.alpha * discovered
-            - self.beta * redundant
+            self.alpha * discovery_multiplier * assigned_discovery
+            + (self.alpha * 0.25) * discovery_multiplier * unassigned_discovery
+            - self.beta * redundant_travel
             - self.tau
             - self.kappa * collided
             - prox_pen
             + team_bonus
-            + bosco_reward_term,
+            + bosco_reward_term
+            - control_cost,
             0.0,
         ).astype(jnp.float32)
 
@@ -568,6 +625,12 @@ class MultiRobotCoverageEnv:
         """Update BOSCO targets. bosco_targets: (N, 2)"""
         return state.replace(bosco_targets=bosco_targets)
 
+    def set_cell_assignments(
+        self, state: EnvState, cell_assignments: jax.Array
+    ) -> EnvState:
+        """Attach BOSCO's per-robot cell partition to environment and critic state."""
+        return state.replace(cell_assignments=cell_assignments.astype(jnp.float32))
+
     def get_obs(self, state: EnvState) -> jax.Array:
         n     = self.num_robots
         
@@ -596,6 +659,24 @@ class MultiRobotCoverageEnv:
 
         parts.append(self._cast_lidar_all(state))
 
+        if self.use_local_coverage_obs:
+            offsets = self._local_patch_offsets
+            c = jnp.cos(state.robot_headings)[:, None, None]
+            s = jnp.sin(state.robot_headings)[:, None, None]
+            local_x = offsets[None, :, :, 0]
+            local_y = offsets[None, :, :, 1]
+            sample_x = state.robot_positions[:, None, None, 0] + c * local_x - s * local_y
+            sample_y = state.robot_positions[:, None, None, 1] + s * local_x + c * local_y
+            cols = jnp.floor(sample_x / self.cell_size).astype(jnp.int32)
+            rows = jnp.floor(sample_y / self.cell_size).astype(jnp.int32)
+            inside = ((cols >= 0) & (cols < self.grid_w)
+                      & (rows >= 0) & (rows < self.grid_h))
+            cols = jnp.clip(cols, 0, self.grid_w - 1)
+            rows = jnp.clip(rows, 0, self.grid_h - 1)
+            source = jnp.maximum(state.coverage_grid, self.wall_grids[state.map_id])
+            patch = jnp.where(inside, source[rows, cols], 1.0)
+            parts.append(patch.reshape(n, self.patch_dim))
+
         return jnp.concatenate(parts, axis=1).astype(jnp.float32)
 
     def get_global_state(self, state: EnvState) -> GlobalState:
@@ -622,6 +703,7 @@ class MultiRobotCoverageEnv:
             kinematics=kinematics, 
             human_positions=human_norm,
             bosco_targets=bosco_norm,
+            cell_assignments=state.cell_assignments,
             map_id=state.map_id
         )
 
@@ -630,13 +712,18 @@ class MultiRobotCoverageEnv:
         me   = occ[..., :, None, :, :]
         rest = (occ.sum(axis=-3, keepdims=True) - occ)[..., :, None, :, :]
         cov  = jnp.broadcast_to(gs.coverage[..., None, None, :, :], me.shape)
+        mine = gs.cell_assignments[..., :, None, :, :]
+        others = (
+            gs.cell_assignments.sum(axis=-3, keepdims=True)
+            - gs.cell_assignments
+        )[..., :, None, :, :]
         
         # Broadcast the specific map's wall grid along all batch dimensions
         wall = self.wall_grids[gs.map_id]                           # (..., H, W)
         wall = jnp.expand_dims(wall, axis=(-3, -4))                 # (..., 1, 1, H, W)
         wall = jnp.broadcast_to(wall, me.shape)                     # (..., N, 1, H, W)
         
-        grid = jnp.concatenate([wall, cov, me, rest], axis=-3)
+        grid = jnp.concatenate([wall, cov, me, rest, mine, others], axis=-3)
 
         joint = gs.kinematics.reshape(*gs.kinematics.shape[:-2], 1, -1)
         

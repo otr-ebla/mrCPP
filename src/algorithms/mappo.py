@@ -114,6 +114,7 @@ class Transition(NamedTuple):
     # Diagnostics only; never read by the update. All (T, E) float32.
     wall_hit:  jax.Array  # fraction of the team that hit a wall this step
     robot_hit: jax.Array  # fraction of the team that hit another robot
+    human_hit: jax.Array  # fraction of the team that hit a human this step
     complete:  jax.Array  # 1.0 when the map was fully covered on this step
     timeout:   jax.Array  # 1.0 when the step hit the truncation horizon
 
@@ -349,6 +350,7 @@ class MAPPO:
                 coverage=info['coverage_ratio'],
                 wall_hit=info['wall_collision_rate'],
                 robot_hit=info['robot_collision_rate'],
+                human_hit=info['human_collision_rate'],
                 complete=info['complete'],
                 timeout=info['timeout'],
             )

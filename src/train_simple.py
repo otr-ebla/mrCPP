@@ -219,8 +219,10 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
                                 'completion_rate', 'timeout_rate',
                                 'collision_end_rate',
                                 'wall_collision_rate', 'robot_collision_rate',
+                                'human_collision_rate',
                                 'wall_collisions_per_episode',
                                 'robot_collisions_per_episode',
+                                'human_collisions_per_episode',
                                 'actor_loss', 'critic_loss', 'entropy', 'std'])
 
     # Per-env accumulators for the episode currently in flight; the rollout is
@@ -229,12 +231,14 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
     ep_len    = np.zeros(E, dtype=np.int64)
     ep_wall   = np.zeros(E, dtype=np.float64)   # team-mean wall hits, summed
     ep_robot  = np.zeros(E, dtype=np.float64)   # team-mean robot-robot hits
+    ep_human  = np.zeros(E, dtype=np.float64)   # team-mean robot-human hits
 
     ep_rewards: list[float] = []
     ep_coverages: list[float] = []              # coverage reached at episode end
     ep_lengths: list[int] = []
     ep_walls: list[float] = []                  # wall collisions per robot, per episode
     ep_robots: list[float] = []
+    ep_humans: list[float] = []
     ep_outcomes: list[int] = []                 # _SUCCESS / _TIMEOUT / _COLLISION
     ep_count = 0
     best_mean_reward = -np.inf
@@ -288,9 +292,10 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
         # ----------------------------------------------------------------
         host_stats = jax.device_get((
             jnp.mean(traj.reward, axis=-1), traj.done, traj.coverage,
-            traj.wall_hit, traj.robot_hit, traj.complete, traj.timeout,
+            traj.wall_hit, traj.robot_hit, traj.human_hit,
+            traj.complete, traj.timeout,
         ))
-        (team_rewards, dones, coverage, wall_hit, robot_hit,
+        (team_rewards, dones, coverage, wall_hit, robot_hit, human_hit,
          complete, timeout) = map(np.asarray, host_stats)
         team_rewards /= reward_scale
         # Already averaged over the team inside the env, so a value of 0.1 means
@@ -300,6 +305,7 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
             ep_len    += 1
             ep_wall   += wall_hit[t]
             ep_robot  += robot_hit[t]
+            ep_human  += human_hit[t]
             finished = np.nonzero(dones[t])[0]
             for e in finished:
                 ep_rewards.append(float(ep_reward[e]))
@@ -308,6 +314,7 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
                 ep_lengths.append(int(ep_len[e]))
                 ep_walls.append(float(ep_wall[e]))
                 ep_robots.append(float(ep_robot[e]))
+                ep_humans.append(float(ep_human[e]))
                 # Full coverage wins over a simultaneous horizon hit; anything
                 # else that ends an episode is a terminal collision, which only
                 # happens when terminate_on_collision is set.
@@ -320,6 +327,7 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
                 ep_len[e]    = 0
                 ep_wall[e]   = 0.0
                 ep_robot[e]  = 0.0
+                ep_human[e]  = 0.0
                 ep_count += 1
 
         # ----------------------------------------------------------------
@@ -336,11 +344,13 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
             # robot bumped into something during one episode.
             ep_wall_mean  = window(ep_walls)
             ep_robot_mean = window(ep_robots)
+            ep_human_mean = window(ep_humans)
             # Same events as an instantaneous rate: the fraction of robot-steps
             # in *this* rollout that ended in a collision. Independent of the
             # episode window, so it reacts immediately to a policy change.
             wall_rate  = float(wall_hit.mean())
             robot_rate = float(robot_hit.mean())
+            human_rate = float(human_hit.mean())
             # Episode-end causes over the window; the three sum to 1.
             # `completion_rate` is the strict success measure — the episode ended
             # because the whole map was covered — as opposed to `mean_ep_cov`,
@@ -364,8 +374,9 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
                 f"critic={float(losses['critic_loss']):7.4f} | "
                 f"entropy={float(losses['entropy']):6.4f} | "
                 f"std={float(losses['std']):5.3f} | "
-                f"wall={wall_rate:6.2%} | "
                 f"rr={robot_rate:6.2%} | "
+                f"rh={human_rate:6.2%} | "
+                f"rw={wall_rate:6.2%} | "
                 f"timeout={timeout_rate:6.2%}"
             )
             with open(log_path, 'a', newline='') as f:
@@ -378,8 +389,10 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
                     round(collision_end_rate, 4),
                     round(wall_rate,      6),
                     round(robot_rate,     6),
+                    round(human_rate,     6),
                     round(ep_wall_mean,   4),
                     round(ep_robot_mean,  4),
+                    round(ep_human_mean,  4),
                     round(float(losses['actor_loss']),  4),
                     round(float(losses['critic_loss']), 4),
                     round(float(losses['entropy']),     4),
@@ -399,8 +412,10 @@ def train(config_path: str, save_dir: str, resume: str | None, backend: str | No
                     'rate/collision_end':            collision_end_rate,
                     'collision/wall_per_robot_step':  wall_rate,
                     'collision/robot_per_robot_step': robot_rate,
+                    'collision/human_per_robot_step': human_rate,
                     'collision/wall_per_episode':     ep_wall_mean,
                     'collision/robot_per_episode':    ep_robot_mean,
+                    'collision/human_per_episode':    ep_human_mean,
                     'loss/actor':                    float(losses['actor_loss']),
                     'loss/critic':                   float(losses['critic_loss']),
                     'loss/entropy':                  float(losses['entropy']),

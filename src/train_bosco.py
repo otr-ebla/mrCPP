@@ -182,12 +182,14 @@ class DeviceEpisodeStats(NamedTuple):
     length:    jax.Array
     wall:      jax.Array
     robot:     jax.Array
+    human:     jax.Array
     hits:      jax.Array
     recent_reward:   jax.Array
     recent_coverage: jax.Array
     recent_length:   jax.Array
     recent_wall:     jax.Array
     recent_robot:    jax.Array
+    recent_human:    jax.Array
     recent_hits:     jax.Array
     recent_outcome:  jax.Array
     ring_pos:   jax.Array
@@ -203,12 +205,14 @@ def _episode_stats_init(num_envs: int) -> DeviceEpisodeStats:
         length=jnp.zeros((num_envs,), jnp.int32),
         wall=zeros_e,
         robot=zeros_e,
+        human=zeros_e,
         hits=zeros_e,
         recent_reward=zeros_w,
         recent_coverage=zeros_w,
         recent_length=zeros_w,
         recent_wall=zeros_w,
         recent_robot=zeros_w,
+        recent_human=zeros_w,
         recent_hits=zeros_w,
         recent_outcome=jnp.zeros((_WINDOW,), jnp.int32),
         ring_pos=jnp.int32(0),
@@ -225,6 +229,7 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
         length=stats.length + 1,
         wall=stats.wall + trans.wall_hit,
         robot=stats.robot + trans.robot_hit,
+        human=stats.human + trans.human_hit,
         hits=stats.hits + jnp.mean(reached, axis=-1),
     )
 
@@ -243,12 +248,14 @@ def _episode_stats_step(stats: DeviceEpisodeStats, trans: Transition,
                 recent_length=x.recent_length.at[pos].set(x.length[env_idx]),
                 recent_wall=x.recent_wall.at[pos].set(x.wall[env_idx]),
                 recent_robot=x.recent_robot.at[pos].set(x.robot[env_idx]),
+                recent_human=x.recent_human.at[pos].set(x.human[env_idx]),
                 recent_hits=x.recent_hits.at[pos].set(x.hits[env_idx]),
                 recent_outcome=x.recent_outcome.at[pos].set(outcome),
                 reward=x.reward.at[env_idx].set(0.0),
                 length=x.length.at[env_idx].set(0),
                 wall=x.wall.at[env_idx].set(0.0),
                 robot=x.robot.at[env_idx].set(0.0),
+                human=x.human.at[env_idx].set(0.0),
                 hits=x.hits.at[env_idx].set(0.0),
                 ring_pos=(pos + 1) % _WINDOW,
                 ring_count=jnp.minimum(x.ring_count + 1, _WINDOW),
@@ -339,6 +346,7 @@ class GuidedRollout:
                     coverage=info['coverage_ratio'],
                     wall_hit=info['wall_collision_rate'],
                     robot_hit=info['robot_collision_rate'],
+                    human_hit=info['human_collision_rate'],
                     complete=info['complete'],
                     timeout=info['timeout'],
                 )
@@ -371,9 +379,14 @@ class GuidedRollout:
         tours = np.full((E, N, MAX_TOUR_LEN), -1, dtype=np.int32)
         tour_lens = np.zeros((E, N), dtype=np.int32)
         targets = np.full((E, N), -1, dtype=np.int32)
+        assignments = np.zeros(
+            (E, N, self.env.grid_h, self.env.grid_w), dtype=np.float32
+        )
         
         for e in range(E):
             self.guides[e].reset(pos[e])
+            owner = self.guides[e].owner.reshape(self.env.grid_h, self.env.grid_w)
+            assignments[e] = np.stack([owner == r for r in range(N)]).astype(np.float32)
             for r in range(N):
                 tour = self.guides[e].tours[r]
                 t_len = min(len(tour), MAX_TOUR_LEN)
@@ -386,7 +399,12 @@ class GuidedRollout:
         coords = self.graph.centers[safe_targets]
         target_coords = np.where(valid[..., None], coords, pos)
         
-        state, obs, gstate = self.env.update_bosco(state, jnp.asarray(target_coords, dtype=jnp.float32))
+        state, obs, gstate = self.env.update_bosco(
+            state, jnp.asarray(target_coords, dtype=jnp.float32)
+        )
+        state, obs, gstate = self.env.update_cell_assignments(
+            state, jnp.asarray(assignments)
+        )
         
         cell_size = self.env.env.cell_size
         col = np.clip((pos[..., 0] / cell_size).astype(np.int32), 0, self.env.grid_w - 1)
@@ -464,7 +482,8 @@ def train(config_path: str, save_dir: str, resume: str | None,
     print(f"Coverable cells: {int(env.free_totals[0])} / {env.num_cells} "
           f"({env.free_totals[0] / env.num_cells:.1%} of the grid)")
     print(f"Guidance: BOSCO next-cell waypoint, arrival bonus {guide_bonus} "
-          f"(alpha={env.alpha} per discovered cell)")
+          f"(discovery alpha={env.alpha}, coverage growth="
+          f"{env.coverage_reward_growth})")
 
     actor = Actor(
         action_dim=action_dim,
@@ -542,8 +561,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
                                 'completion_rate', 'timeout_rate',
                                 'collision_end_rate',
                                 'wall_collision_rate', 'robot_collision_rate',
+                                'human_collision_rate',
                                 'wall_collisions_per_episode',
                                 'robot_collisions_per_episode',
+                                'human_collisions_per_episode',
                                 'guide_hits_per_episode', 'guide_hit_rate',
                                 'actor_loss', 'critic_loss', 'entropy', 'std'])
 
@@ -588,14 +609,15 @@ def train(config_path: str, save_dir: str, resume: str | None,
             s = carry.episode_stats
             compact = jax.device_get((
                 s.recent_reward, s.recent_coverage, s.recent_length,
-                s.recent_wall, s.recent_robot, s.recent_hits,
+                s.recent_wall, s.recent_robot, s.recent_human, s.recent_hits,
                 s.recent_outcome, s.ring_count, s.total_count,
                 jnp.mean(traj.coverage[-1]), jnp.mean(traj.wall_hit),
-                jnp.mean(traj.robot_hit), jnp.mean(hits), metrics,
+                jnp.mean(traj.robot_hit), jnp.mean(traj.human_hit),
+                jnp.mean(hits), metrics,
             ))
             (recent_reward, recent_coverage, recent_length, recent_wall,
-             recent_robot, recent_hits, recent_outcome, ring_count,
-             ep_count, last_cov, wall_rate, robot_rate, guide_rate,
+             recent_robot, recent_human, recent_hits, recent_outcome, ring_count,
+             ep_count, last_cov, wall_rate, robot_rate, human_rate, guide_rate,
              losses) = compact
             count = int(ring_count)
             ep_count = int(ep_count)
@@ -609,10 +631,12 @@ def train(config_path: str, save_dir: str, resume: str | None,
             mean_ep_len = recent_mean(recent_length)
             ep_wall_mean = recent_mean(recent_wall)
             ep_robot_mean = recent_mean(recent_robot)
+            ep_human_mean = recent_mean(recent_human)
             ep_hit_mean = recent_mean(recent_hits)
             last_cov = float(last_cov)
             wall_rate = float(wall_rate)
             robot_rate = float(robot_rate)
+            human_rate = float(human_rate)
             # Fraction of robot-steps that ended on the waypoint. A robot needs
             # ~5 steps to cross a 0.5 m cell at v_max, so 0.2 is the arithmetic
             # ceiling, but BOSCO itself only reaches 0.095 on this map — a 90°
@@ -639,8 +663,9 @@ def train(config_path: str, save_dir: str, resume: str | None,
                 f"critic={float(losses['critic_loss']):7.4f} | "
                 f"entropy={float(losses['entropy']):6.4f} | "
                 f"std={float(losses['std']):5.3f} | "
-                f"wall={wall_rate:6.2%} | "
                 f"rr={robot_rate:6.2%} | "
+                f"rh={human_rate:6.2%} | "
+                f"rw={wall_rate:6.2%} | "
                 f"timeout={timeout_rate:6.2%}",
                 flush=True,
             )
@@ -654,8 +679,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     round(collision_end_rate, 4),
                     round(wall_rate,      6),
                     round(robot_rate,     6),
+                    round(human_rate,     6),
                     round(ep_wall_mean,   4),
                     round(ep_robot_mean,  4),
+                    round(ep_human_mean,  4),
                     round(ep_hit_mean,    4),
                     round(guide_rate,     6),
                     round(float(losses['actor_loss']),  4),
@@ -677,8 +704,10 @@ def train(config_path: str, save_dir: str, resume: str | None,
                     'rate/collision_end':             collision_end_rate,
                     'collision/wall_per_robot_step':  wall_rate,
                     'collision/robot_per_robot_step': robot_rate,
+                    'collision/human_per_robot_step': human_rate,
                     'collision/wall_per_episode':     ep_wall_mean,
                     'collision/robot_per_episode':    ep_robot_mean,
+                    'collision/human_per_episode':    ep_human_mean,
                     'guide/hit_per_robot_step':       guide_rate,
                     'guide/hits_per_episode':         ep_hit_mean,
                     'loss/actor':                     float(losses['actor_loss']),

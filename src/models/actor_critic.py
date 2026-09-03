@@ -115,7 +115,8 @@ class Critic(nn.Module):
     """
     Centralised critic: V_i(s) from the agent-centred global state.
 
-    The map channels [walls, coverage, self, teammates] make the estimate
+    The map channels [walls, coverage, self, teammates, my assignment,
+    teammates' assignments] make the estimate
     agent-specific, which is what lets each robot get its own advantage while
     the value still sees the whole team.
     """
