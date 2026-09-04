@@ -1,7 +1,9 @@
-# mrCPP — Multi-Robot Coverage Path Planning with Dynamic Obstacles
+# mrCPP — Multi-Agent Reinforcement Learning for Multi-Robot Coverage Path Planning with Dynamic Obstacles
 
 [![JAX](https://img.shields.io/badge/JAX-Enabled-orange?style=flat-square&logo=google)](https://github.com/google/jax)
 [![CUDA](https://img.shields.io/badge/CUDA-Accelerated-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
+
+![Simulated Environment](simulated_environment.gif)
 
 **mrCPP** addresses **multi-robot coverage path planning (CPP)**: a team of robots must jointly visit every reachable cell of an unknown or partially known environment as efficiently as possible, while avoiding collisions with static structures and **dynamic obstacles** (e.g., pedestrians moving through the workspace).
 
