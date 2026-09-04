@@ -61,6 +61,43 @@ The project evaluates architectures in increasing order of complexity:
   per-robot-step rate and as a per-episode count), the PPO losses, policy sigma
   and the decayed learning rates.
 
+### Policy benchmark
+
+Run the standard comparisons for 1,000 episodes each: plain BOSCO without
+humans, plain BOSCO with dynamic obstacles, guided MARL trained without humans,
+and guided MARL trained with eight humans. Dynamic-obstacle scenarios use eight
+humans by default:
+
+```bash
+python -m src.evaluate_policies --episodes 1000 --output-dir evaluation_results
+```
+
+Change every dynamic-obstacle scenario with `--humans N`, for example
+`--humans 4`. This affects plain BOSCO with humans and both MARL evaluations,
+but does not change the additional zero-human BOSCO baseline or which training
+checkpoint is loaded.
+
+The summary table reports mutually exclusive episode percentages: success /
+coverage rate, robot-robot collision rate (RRCR), robot-wall collision rate
+(RWCR), robot-human collision rate (RHCR), and timeout rate (TOR). These columns
+sum to 100% for each policy. An unsuccessful episode with multiple collision
+types is assigned to its most frequent collision type (ties prefer human, then
+robot, then wall); an unsuccessful episode without contact is a timeout. The
+table also reports mean simulated completion time over successful episodes only.
+
+The command uses the archived checkpoints in `checkpoints/archive` by default
+and records completion time in both simulation steps and simulated seconds
+(`NaN` for episodes that do not complete). It writes per-episode data
+(`episodes.csv`), means/standard deviations/95%
+confidence intervals (`summary.csv`), run metadata, and multi-panel vector
+figures (`policy_benchmark.pdf` and `policy_benchmark.svg`). Use `--help` for
+checkpoint, accelerator, batching, seed, and horizon overrides.
+
+Evaluation rollouts use 50 parallel environments by default (`--batch-size 50`).
+Environment stepping, BOSCO route following, guided-policy inference, guidance,
+and episode transitions run in compiled JAX scans on CUDA when available;
+plotting and CSV serialization happen on the CPU after each rollout chunk.
+
 ---
 
 ## 🚀 Getting Started
@@ -73,4 +110,3 @@ cd mrCPP
 pip install -r requirements.txt
 
 ---
-

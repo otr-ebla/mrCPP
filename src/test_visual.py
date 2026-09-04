@@ -117,7 +117,8 @@ def _ownership_palette(num_robots: int) -> np.ndarray:
     return lut.astype(np.uint8)
 
 
-def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
+def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool,
+              controller=None) -> dict:
     """Pull the arrays needed for one frame back to the host in one go.
 
     Device→host transfers are the only per-frame cost of rendering, so every
@@ -130,6 +131,7 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         state.human_positions if env.num_humans > 0 else jnp.zeros((0, 2), jnp.float32),
         state.human_headings if env.num_humans > 0 else jnp.zeros((0,), jnp.float32),
         state.coverage_grid,
+        state.bosco_targets,
         state.robot_alive,
         info['step'],
         info['coverage_ratio'],
@@ -142,15 +144,16 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         env._cast_lidar_all(state)
         if want_lidar else jnp.zeros((0,), jnp.float32),
     )
-    (pos, hdg, human_pos, human_hdg, grid, alive, step, cov_ratio,
+    (pos, hdg, human_pos, human_hdg, grid, bosco_targets, alive, step, cov_ratio,
      covered, total, timeout, wall_hits, robot_hits, human_hits,
      lidar) = jax.device_get(payload)
-    return {
+    snap = {
         'positions':      np.asarray(pos),
         'headings':       np.asarray(hdg),
         'human_positions': np.asarray(human_pos),
         'human_headings': np.asarray(human_hdg),
         'coverage_grid':  np.asarray(grid),
+        'bosco_targets':  np.asarray(bosco_targets),
         'alive':          np.asarray(alive),
         'step':           int(step),
         'coverage_ratio': float(cov_ratio),
@@ -162,6 +165,23 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool) -> dict:
         'human_hits':     np.asarray(human_hits),
         'lidar':          np.asarray(lidar),
     }
+    if controller is not None and hasattr(controller, 'bosco_goal_centers'):
+        snap['bosco_goal_centers'] = controller.bosco_goal_centers(
+            snap['coverage_grid'], snap['positions']
+        )
+    return snap
+
+
+def _star_points(center: tuple[int, int], outer: int, inner: int) -> list[tuple[int, int]]:
+    """Return the ten vertices of a five-point star."""
+    cx, cy = center
+    angles = -np.pi / 2.0 + np.arange(10) * np.pi / 5.0
+    radii = np.where(np.arange(10) % 2 == 0, outer, inner)
+    return [
+        (int(round(cx + radius * np.cos(angle))),
+         int(round(cy + radius * np.sin(angle))))
+        for angle, radius in zip(angles, radii)
+    ]
 
 
 def _episode_outcome(snap: dict) -> tuple[str, tuple[int, int, int]] | None:
@@ -261,6 +281,41 @@ def _draw_frame(
 
     positions = snap['positions']
     headings  = snap['headings']
+
+    # The star marks the next still-uncovered cell in each robot's remaining
+    # BOSCO tour.  It can differ from the dot when the immediate waypoint is a
+    # covered transit cell on the path to that pending coverage objective.
+    goal_centers = snap.get('bosco_goal_centers')
+    if goal_centers is not None:
+        star_outer = max(6, int(cell_px * 0.28))
+        star_inner = max(3, int(star_outer * 0.45))
+        for i, goal in enumerate(goal_centers):
+            if not np.all(np.isfinite(goal)):
+                continue
+            gx, gy = _to_px(goal[0], goal[1], mh)
+            color = _ROBOT_COLORS[i % len(_ROBOT_COLORS)]
+            pygame.draw.polygon(
+                surface,
+                COLORS['border'],
+                _star_points((gx, gy), star_outer + 2, star_inner + 1),
+            )
+            pygame.draw.polygon(
+                surface,
+                color,
+                _star_points((gx, gy), star_outer, star_inner),
+            )
+
+    # -- Current BOSCO immediate waypoints --
+    # Draw the dot after the star so both remain visible when the immediate
+    # waypoint is itself the next uncovered tour cell.
+    target_radius = max(3, int(cell_px * 0.12))
+    targets = snap['bosco_targets']
+    valid_targets = np.linalg.norm(targets - positions, axis=1) > 1e-5
+    for i in np.flatnonzero(valid_targets):
+        tx, ty = _to_px(targets[i, 0], targets[i, 1], mh)
+        color = _ROBOT_COLORS[i % len(_ROBOT_COLORS)]
+        pygame.draw.circle(surface, COLORS['border'], (tx, ty), target_radius + 2)
+        pygame.draw.circle(surface, color, (tx, ty), target_radius)
 
     # -- Lidar rays (toggle with 'L') --
     if show_lidar and snap['lidar'].size:
@@ -487,6 +542,63 @@ class MappoController:
         )
         return state, rewards, terminated, truncated
 
+    def bosco_goal_centers(self, coverage_grid: np.ndarray,
+                           positions: np.ndarray) -> np.ndarray:
+        """Centre of the first uncovered tour cell remaining for each robot."""
+        goals = np.full((self.env.num_robots, 2), np.nan, dtype=np.float32)
+        if not self.guided or self.guide_state is None:
+            return goals
+
+        tours, idx, lens = jax.device_get((
+            self.guide_state.tours[0],
+            self.guide_state.idx[0],
+            self.guide_state.tour_lens[0],
+        ))
+        covered = np.asarray(coverage_grid).reshape(-1) > 0.5
+        centers = np.asarray(jax.device_get(self.graph_centers))
+        needs_mopup = np.zeros(self.env.num_robots, dtype=bool)
+        for robot in range(self.env.num_robots):
+            remaining = np.asarray(tours[robot, idx[robot]:lens[robot]], dtype=np.int64)
+            pending = remaining[(remaining >= 0) & ~covered[np.maximum(remaining, 0)]]
+            if pending.size:
+                goals[robot] = centers[pending[0]]
+            else:
+                needs_mopup[robot] = True
+
+        # Once a fixed tour is exhausted, JAX dynamically splits all reachable
+        # uncovered cells among the robots.  Reproduce that split for rendering
+        # so the star continues to show the final mop-up objective even when the
+        # immediate dot is a covered transit waypoint.
+        if np.any(needs_mopup):
+            graph_free = np.asarray(jax.device_get(self.graph_free), dtype=bool)
+            components = np.asarray(jax.device_get(self.graph_components))
+            cols = np.clip(
+                (positions[:, 0] / self.env.cell_size).astype(np.int32),
+                0, self.env.grid_w - 1,
+            )
+            rows = np.clip(
+                (positions[:, 1] / self.env.cell_size).astype(np.int32),
+                0, self.env.grid_h - 1,
+            )
+            cells = rows * self.env.grid_w + cols
+            ids = np.arange(covered.size)
+            cell_rows, cell_cols = cells // self.env.grid_w, cells % self.env.grid_w
+            grid_rows, grid_cols = ids // self.env.grid_w, ids % self.env.grid_w
+            distance = (
+                np.abs(cell_rows[:, None] - grid_rows[None, :])
+                + np.abs(cell_cols[:, None] - grid_cols[None, :])
+            )
+            reachable = components[None, :] == components[cells, None]
+            pending = graph_free[None, :] & ~covered[None, :] & reachable
+            owner = np.argmin(np.where(pending, distance, np.inf), axis=0)
+            for robot in np.flatnonzero(needs_mopup):
+                assigned = pending[robot] & (owner == robot)
+                candidates = assigned if np.any(assigned) else pending[robot]
+                if np.any(candidates):
+                    score = np.where(candidates, distance[robot], np.inf)
+                    goals[robot] = centers[int(np.argmin(score))]
+        return goals
+
 
 class BoscoController:
     """Deterministic boustrophedon expert, driven from the render snapshot.
@@ -545,7 +657,7 @@ def run_episode(
     current_walls = np.asarray(env.walls[current_map_id])
     current_free = np.asarray(env.free_mask_np[current_map_id])
 
-    snap = _snapshot(env, state, view_state['show_lidar'])
+    snap = _snapshot(env, state, view_state['show_lidar'], controller)
 
     while True:
         for event in pygame.event.get():
@@ -592,7 +704,7 @@ def run_episode(
 
         state, rewards, terminated, truncated = controller.step(state, snap)
         ep_reward += float(jnp.mean(rewards))
-        snap = _snapshot(env, state, view_state['show_lidar'])
+        snap = _snapshot(env, state, view_state['show_lidar'], controller)
 
         if bool(terminated) or bool(truncated):
             outcome = _episode_outcome(snap)
