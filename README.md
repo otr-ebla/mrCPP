@@ -1,4 +1,4 @@
-# mrCPP — Multi-Agent Reinforcement Learning for Multi-Robot Coverage Path Planning with Dynamic Obstacles
+# Multi-Agent Reinforcement Learning for Multi-Robot Coverage Path Planning with Dynamic Obstacles
 
 [![JAX](https://img.shields.io/badge/JAX-Enabled-orange?style=flat-square&logo=google)](https://github.com/google/jax)
 [![CUDA](https://img.shields.io/badge/CUDA-Accelerated-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
