@@ -385,8 +385,16 @@ def _balance_by_swap(graph: TraversabilityGraph, owner: np.ndarray,
     Evaluates all borders between regions and diffuses cells from larger
     regions to smaller ones. This allows cells to flow across intermediate
     robots, fixing cases where a robot is "boxed in" by the wavefront.
-    Runs until every robot's count is within 1 of its target or no swap
-    is possible.
+
+    Balance is the primary objective, but equal balancing moves are ranked by
+    their local perimeter change.  If ``c`` has ``k_d`` neighbours in the
+    donor and ``k_r`` in the receiver, transferring it changes the inter-region
+    boundary in proportion to ``k_d - k_r``.  Minimising that quantity fills
+    bays and broad fronts before extending one-cell-wide tendrils.  Distance
+    from the receiver's spawn remains the final compactness tie-break.
+
+    Runs until every robot's count is within 1 of its target or no swap is
+    possible.
     """
     owner = owner.copy()
     counts = np.array([(owner == r).sum() for r in range(n_robots)],
@@ -414,10 +422,31 @@ def _balance_by_swap(graph: TraversabilityGraph, owner: np.ndarray,
                 
                 count_diff = counts[donor] - counts[recv]
                 if count_diff > 1.1:  # strictly greater than 1 (allowing for float inaccuracies)
-                    # We want to maximize count_diff, and minimize distance
-                    # We store (-count_diff, dist) to use min-heap / sort
+                    donor_neighbors = 0
+                    receiver_neighbors = 0
+                    for adjacent in graph.neighbors[c]:
+                        adjacent = int(adjacent)
+                        if adjacent < 0:
+                            continue
+                        adjacent_owner = int(owner[adjacent])
+                        donor_neighbors += adjacent_owner == donor
+                        receiver_neighbors += adjacent_owner == recv
+
+                    # Primary: repair the largest imbalance. Secondary: minimise
+                    # the new perimeter, then prefer the broadest attachment to
+                    # the receiver. Distance and cell id keep the result compact
+                    # and deterministic when the local geometry is identical.
+                    perimeter_delta = donor_neighbors - receiver_neighbors
                     cost = float(dist[recv, c])
-                    candidates.append((-count_diff, cost, c, donor, recv))
+                    candidates.append((
+                        -count_diff,
+                        perimeter_delta,
+                        -receiver_neighbors,
+                        cost,
+                        c,
+                        donor,
+                        recv,
+                    ))
                     
         if not candidates:
             break  # No border cells can be swapped to improve balance
@@ -427,7 +456,7 @@ def _balance_by_swap(graph: TraversabilityGraph, owner: np.ndarray,
         candidates.sort()
         
         swapped = False
-        for _, _, c, donor, recv in candidates:
+        for _, _, _, _, c, donor, recv in candidates:
             if _is_connected_after_removal(graph, owner, donor, c, int(starts[donor])):
                 owner[c] = recv
                 counts[donor] -= 1

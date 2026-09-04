@@ -10,6 +10,9 @@ Usage (from the project root):
     python -m src.test_visual
     python -m src.test_visual --checkpoint checkpoints/checkpoint_final.pkl --episodes 10
     python -m src.test_visual --policy bosco
+
+Playback controls: RIGHT or R skips the current episode, SPACE pauses, L toggles
+LiDAR, O toggles ownership, S changes speed, and ESC quits.
 """
 
 from __future__ import annotations
@@ -391,7 +394,8 @@ def _draw_frame(
             f"({snap['covered_cells']}/{snap['total_cells']}) | "
             f"Reward {ep_reward:8.2f} | "
             f"Speed {speed_label} | "
-            f"[ESC] quit [SPACE] pause [R] reset [L] lidar [O] owners [S] speed")
+            f"[ESC] quit [RIGHT/R] next [SPACE] pause "
+            f"[L] lidar [O] owners [S] speed")
     rendered = font.render(text, True, COLORS['hud_text'])
     line_h = rendered.get_height()
     top = win_h - HUD_HEIGHT + (HUD_HEIGHT - (2 * line_h if show_owner else line_h)) // 2
@@ -683,9 +687,10 @@ def run_episode(
     palette: np.ndarray,
     fps: int,
     view_state: dict,
-) -> float | None:
-    """Run one episode. Returns total reward, or None if the user quit."""
-    state = env.reset(key)
+    map_id: int,
+) -> tuple[float, bool] | None:
+    """Run one episode; the bool requests a different layout next time."""
+    state = env.reset(key, jnp.int32(map_id))
     state = controller.reset(state)
 
     ep_reward = 0.0
@@ -707,7 +712,9 @@ def run_episode(
                 if event.key == pygame.K_SPACE:
                     view_state['paused'] = not view_state.get('paused', False)
                 if event.key == pygame.K_r:
-                    return ep_reward   # early reset
+                    return ep_reward, False  # new spawn, same layout
+                if event.key == pygame.K_RIGHT:
+                    return ep_reward, True   # new spawn and next procedural layout
                 if event.key == pygame.K_l:
                     view_state['show_lidar'] = not view_state['show_lidar']
                 if event.key == pygame.K_o:
@@ -760,7 +767,7 @@ def run_episode(
             pygame.display.flip()
             if current_fps > 0:
                 clock.tick(current_fps)
-            return ep_reward
+            return ep_reward, True
 
 
 def _load_checkpoint(
@@ -825,6 +832,9 @@ def main() -> None:
                         help='Path to YAML config file')
     parser.add_argument('--episodes',   type=int, default=0,
                         help='Episodes to run; 0 = loop forever (default: 0)')
+    parser.add_argument('--layouts',    type=int, default=16,
+                        help='Procedural layouts kept in the visualisation bank; '
+                             'episodes cycle through them (default: 16)')
     parser.add_argument('--fps',        type=int, default=FPS,
                         help=f'Rendering FPS (default: {FPS})')
     parser.add_argument('--seed',       type=int, default=0,
@@ -849,8 +859,14 @@ def main() -> None:
                              'training config.')
     args = parser.parse_args()
 
+    if args.layouts < 2:
+        parser.error('--layouts must be at least 2 so RIGHT can select a new layout')
+
     config    = load_config(args.config)
     env_cfg   = config.get('env',   {})
+    # Guided training uses one map, but visual evaluation rebuilds the BOSCO
+    # graph at every reset and can therefore cycle through a larger map bank.
+    env_cfg = {**env_cfg, 'num_maps': args.layouts}
     if args.humans > 0:
         env_cfg['num_humans'] = args.humans
     if args.terminate_on_collision is not None:
@@ -933,17 +949,22 @@ def main() -> None:
     key = jax.random.PRNGKey(args.seed)
 
     ep_num = 0
+    map_id = 0
     try:
         while args.episodes == 0 or ep_num < args.episodes:
             key, ep_key = jax.random.split(key)
-            print(f"Episode {ep_num + 1} ...", end='', flush=True)
+            print(f"Episode {ep_num + 1} (layout {map_id + 1}/{env.num_maps}) ...",
+                  end='', flush=True)
             ret = run_episode(env, controller, ep_key, surface, clock, font,
-                               popup_font, palette, args.fps, view_state)
+                               popup_font, palette, args.fps, view_state, map_id)
             if ret is None:
                 print("  (quit)")
                 break
-            print(f"  total reward = {ret:.2f}")
+            reward, advance_layout = ret
+            print(f"  total reward = {reward:.2f}")
             ep_num += 1
+            if advance_layout:
+                map_id = (map_id + 1) % env.num_maps
     finally:
         pygame.quit()
 

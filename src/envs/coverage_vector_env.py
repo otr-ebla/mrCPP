@@ -406,9 +406,12 @@ class MultiRobotCoverageEnv:
         (chosen, _), _ = jax.lax.scan(body, init, shuffled)
         return chosen
 
-    def reset(self, key: jax.Array) -> EnvState:
+    def reset(self, key: jax.Array, map_id: jax.Array | None = None) -> EnvState:
         key, map_key, spawn_key, r_hdg_key, h_hdg_key, h_dist_key = jax.random.split(key, 6)
-        map_id = jax.random.randint(map_key, (), 0, self.num_maps)
+        if map_id is None:
+            map_id = jax.random.randint(map_key, (), 0, self.num_maps)
+        else:
+            map_id = jnp.asarray(map_id, dtype=jnp.int32)
         
         total_spawns = self.num_robots + self.num_humans
         spawns = self._sample_spawns(spawn_key, map_id, total_spawns)
