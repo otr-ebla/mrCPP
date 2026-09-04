@@ -1438,9 +1438,10 @@ def run_episode(env, expert: BoscoExpert, key, collect: bool = False):
             break
 
     covered = float(np.sum(np.asarray(state.coverage_grid)))
+    free_total = float(np.asarray(env.free_totals)[int(np.asarray(state.map_id))])
     stats = {
         'steps': t + 1,
-        'coverage': covered / env.free_total,
+        'coverage': covered / free_total,
         'covered_cells': covered,
         'collisions': collisions,
         'team_return': team_return,
@@ -1484,7 +1485,7 @@ def main() -> None:
     })
     expert = BoscoExpert(env)
 
-    print(f"map: {env.grid_h}x{env.grid_w} cells, {int(env.free_total)} coverable, "
+    print(f"map: {env.grid_h}x{env.grid_w} cells, {int(env.free_totals[0])} coverable, "
           f"{int(expert._isolated.sum())} unreachable by the robot disc")
 
     all_obs, all_act, ep_id, ag_id = [], [], [], []

@@ -1,17 +1,26 @@
 {
   "episodes_per_policy": 1000,
   "seed": 0,
-  "marl_evaluation_humans": 8,
-  "plain_bosco_evaluation_humans": 0,
+  "dynamic_obstacle_evaluation_humans": 8,
+  "plain_bosco_evaluation_humans": [
+    0,
+    8
+  ],
   "config": "/home/alberto_vaglio/mrCPP/config/mappo_baseline.yaml",
   "backend": "cuda (NVIDIA GeForce RTX 3080)",
   "stochastic": false,
-  "elapsed_seconds": 330.2717590332031,
+  "elapsed_seconds": 432.32156133651733,
   "policies": [
     {
       "name": "Plain BOSCO (0 humans)",
       "kind": "bosco",
       "humans": 0,
+      "checkpoint": null
+    },
+    {
+      "name": "Plain BOSCO (8 humans)",
+      "kind": "bosco",
+      "humans": 8,
       "checkpoint": null
     },
     {

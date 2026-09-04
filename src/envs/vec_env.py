@@ -129,6 +129,9 @@ class VecEnv:
             # replace the final coverage of a finished episode with the fresh
             # episode's empty grid, making end-of-episode coverage unobservable.
             info = self.env.get_info(s)
+            # Preserve post-step positions across auto-reset. Evaluation uses
+            # them to count entries into cells that were already covered.
+            info['robot_positions'] = s.robot_positions
 
             key, reset_key = jax.random.split(s.key)
             fresh = self.env.reset(reset_key).replace(

@@ -8,8 +8,8 @@ The default experiment evaluates 1,000 episodes for each of:
   * BOSCO-guided MARL trained with eight humans.
 
 Raw episode data, aggregate statistics, run metadata, a PDF and an SVG are
-written to the output directory.  MARL environments run in accelerator batches;
-all policy rollouts execute inside compiled JAX scans on the selected accelerator.
+written to the output directory. MARL environments run in compiled accelerator
+batches; plain BOSCO uses the same host-side expert controller as the visual test.
 """
 
 from __future__ import annotations
@@ -32,9 +32,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.algorithms.bosco_guide import make_guides
+from src.algorithms.bosco import BoscoExpert
 from src.algorithms.jax_bosco import JaxGuideState, jax_guide_step
 from src.algorithms.mappo import RunningMeanStd, rms_normalize
 from src.envs.vec_env import VecEnv
+from src.envs.coverage_vector_env import MultiRobotCoverageEnv
 from src.models.actor_critic import Actor
 from src.utils.config_parser import load_config
 from src.utils.jax_device import describe, select_device
@@ -51,7 +53,8 @@ FIELDS = [
     "covered_cells", "completion", "timeout", "collision_end", "team_return",
     "wall_collisions", "robot_collisions", "human_collisions", "all_collisions",
     "wall_collision_rate", "robot_collision_rate", "human_collision_rate",
-    "all_collision_rate", "revisits", "cell_entries", "sweep_efficiency",
+    "all_collision_rate", "revisits", "cell_entries", "revisit_rate",
+    "sweep_efficiency",
 ]
 
 
@@ -79,6 +82,8 @@ def _empty_accumulators(n: int) -> dict[str, np.ndarray]:
         "wall": np.zeros(n, np.float64),
         "robot": np.zeros(n, np.float64),
         "human": np.zeros(n, np.float64),
+        "revisits": np.zeros(n, np.float64),
+        "entries": np.zeros(n, np.float64),
     }
 
 
@@ -105,6 +110,7 @@ def _record(name: str, episode: int, seed: int, humans: int, steps: int,
         "human_collision_rate": human / denom,
         "all_collision_rate": total / denom,
         "revisits": revisits, "cell_entries": entries,
+        "revisit_rate": revisits / entries if entries > 0 else 0.0,
         "sweep_efficiency": efficiency,
     }
 
@@ -193,11 +199,43 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                 desired = jnp.arctan2(delta[..., 1], delta[..., 0])
                 angle = (desired - state.robot_headings + jnp.pi) % (2 * jnp.pi) - jnp.pi
                 turn = jnp.clip(3.0 * angle / env.omega_max, -1.0, 1.0)
-                speed = jnp.clip(1.0 - jnp.abs(angle) / 0.7, 0.0, 1.0)
+                # A cell-centre waypoint often changes direction by 90 degrees.
+                # Driving during that turn gives this differential-drive model a
+                # one-metre turning radius, much wider than a half-metre cell,
+                # and used to wedge the nominal BOSCO baseline into walls.  Make
+                # the adapter rotate first, then cross the next graph edge.
+                distance = jnp.linalg.norm(delta, axis=-1)
+                speed = jnp.where(
+                    jnp.abs(angle) <= 0.10,
+                    jnp.clip(distance / (env.v_max * env.dt), 0.0, 1.0),
+                    0.0,
+                )
                 actions = jnp.stack([2.0 * speed - 1.0, turn], axis=-1)
                 actions = jnp.where(valid[..., None], actions,
                                     jnp.array([-1.0, 0.0], jnp.float32))
             next_state, _, rewards, term, done, info, _ = vec_env.step(state, actions)
+            previous_col = jnp.clip(
+                (state.robot_positions[..., 0] / env.cell_size).astype(jnp.int32),
+                0, env.grid_w - 1,
+            )
+            previous_row = jnp.clip(
+                (state.robot_positions[..., 1] / env.cell_size).astype(jnp.int32),
+                0, env.grid_h - 1,
+            )
+            current_col = jnp.clip(
+                (info["robot_positions"][..., 0] / env.cell_size).astype(jnp.int32),
+                0, env.grid_w - 1,
+            )
+            current_row = jnp.clip(
+                (info["robot_positions"][..., 1] / env.cell_size).astype(jnp.int32),
+                0, env.grid_h - 1,
+            )
+            previous_cell = previous_row * env.grid_w + previous_col
+            current_cell = current_row * env.grid_w + current_col
+            entered = current_cell != previous_cell
+            covered_before = state.coverage_grid.reshape(vec_env.E, -1)
+            env_ids = jnp.arange(vec_env.E)[:, None]
+            revisited = entered & (covered_before[env_ids, current_cell] > 0.5)
             next_guide, waypoint, _ = jax_guide_step(
                 guide_state, next_state.robot_positions, next_state.coverage_grid, done,
                 neighbors, vec_env.grid_w, vec_env.grid_h, env.cell_size,
@@ -211,7 +249,8 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             output = (rewards.sum(axis=-1), done, term, info["coverage_ratio"],
                       info["covered_cells"], info["complete"], info["timeout"],
                       info["wall_collision_rate"], info["robot_collision_rate"],
-                      info["human_collision_rate"])
+                      info["human_collision_rate"], jnp.sum(revisited, axis=-1),
+                      jnp.sum(entered, axis=-1))
             return (next_state, next_obs, next_guide), output
         return jax.lax.scan(one, carry, keys)
 
@@ -227,13 +266,16 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
         keys = jax.random.split(chunk_key, chunk_steps)
         (state, obs, guide_state), outputs = run_chunk((state, obs, guide_state), keys)
         arrays = [np.asarray(x) for x in jax.device_get(outputs)]
-        rewards, dones, terms, coverage, covered, complete, timeout, walls, robots, humans = arrays
+        (rewards, dones, terms, coverage, covered, complete, timeout, walls,
+         robots, humans, revisits, entries) = arrays
         for t in range(chunk_steps):
             accum["steps"] += 1
             accum["return"] += rewards[t]
             accum["wall"] += walls[t] * env.num_robots
             accum["robot"] += robots[t] * env.num_robots
             accum["human"] += humans[t] * env.num_robots
+            accum["revisits"] += revisits[t]
+            accum["entries"] += entries[t]
             for e in np.flatnonzero(dones[t]):
                 if len(rows) >= episodes:
                     break
@@ -245,6 +287,9 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
                     float(accum["wall"][e]), float(accum["robot"][e]),
                     float(accum["human"][e]), env.num_robots, env.dt,
                     float(terms[t, e] and not complete[t, e]),
+                    float(accum["revisits"][e]), float(accum["entries"][e]),
+                    float((accum["entries"][e] - accum["revisits"][e])
+                          / max(accum["entries"][e], 1.0)),
                 ))
                 for values in accum.values():
                     values[e] = 0
@@ -256,6 +301,69 @@ def evaluate_marl(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
             eta = elapsed / len(rows) * (episodes - len(rows)) if rows else float("nan")
             print(f"{spec.name}: {len(rows)}/{episodes} ({100 * len(rows) / episodes:.1f}%) "
                   f"| elapsed {elapsed / 60:.1f} min | ETA {eta / 60:.1f} min", flush=True)
+    return rows
+
+
+def evaluate_bosco(spec: PolicySpec, config_path: Path, episodes: int, seed: int,
+                   max_steps: int | None, progress_every: int) -> list[dict]:
+    """Evaluate the same host-side BOSCO expert used by ``test_visual``."""
+    _, env_cfg = _env_config(config_path, spec.humans, max_steps)
+    env = MultiRobotCoverageEnv(env_cfg)
+    expert = BoscoExpert(env)
+    step = jax.jit(env.step)
+    rows = []
+    started = time.time()
+    print(f"{spec.name}: starting {episodes} episodes (visual BOSCO controller)",
+          flush=True)
+    for episode in range(episodes):
+        state = env.reset(jax.random.PRNGKey(seed + episode))
+        expert.reset(np.asarray(state.robot_positions),
+                     map_id=int(np.asarray(state.map_id)))
+        steps = 0
+        team_return = wall = robot = human = revisits = entries = 0.0
+        previous_cell = expert.graph.cell_of(np.asarray(state.robot_positions))
+        terminated = truncated = False
+        while not (terminated or truncated):
+            actions = expert.act(
+                np.asarray(state.robot_positions),
+                np.asarray(state.robot_headings),
+                np.asarray(state.coverage_grid),
+            )
+            covered_before = np.asarray(state.coverage_grid).reshape(-1) > 0.5
+            state, rewards, terminated_array, truncated_array = step(
+                state, jnp.asarray(actions)
+            )
+            terminated = bool(terminated_array)
+            truncated = bool(truncated_array)
+            current_cell = expert.graph.cell_of(np.asarray(state.robot_positions))
+            entered = current_cell != previous_cell
+            entries += float(np.sum(entered))
+            revisits += float(np.sum(entered & covered_before[current_cell]))
+            previous_cell = current_cell
+            team_return += float(np.sum(np.asarray(rewards)))
+            wall += float(np.sum(np.asarray(state.wall_hits)))
+            robot += float(np.sum(np.asarray(state.robot_hits)))
+            human += float(np.sum(np.asarray(state.human_hits)))
+            steps += 1
+
+        info = env.get_info(state)
+        complete = float(info["complete"])
+        rows.append(_record(
+            spec.name, episode, seed, spec.humans, steps,
+            float(info["coverage_ratio"]), float(info["covered_cells"]), complete,
+            float(bool(truncated) and not complete), team_return, wall, robot, human,
+            env.num_robots, env.dt, float(bool(terminated) and not complete),
+            revisits, entries, (entries - revisits) / max(entries, 1.0),
+        ))
+        if progress_every and ((episode + 1) % progress_every == 0
+                               or episode + 1 == episodes):
+            elapsed = time.time() - started
+            done_count = episode + 1
+            eta = elapsed / done_count * (episodes - done_count)
+            print(f"{spec.name}: {done_count}/{episodes} "
+                  f"({100 * done_count / episodes:.1f}%) | "
+                  f"elapsed {elapsed / 60:.1f} min | ETA {eta / 60:.1f} min",
+                  flush=True)
     return rows
 
 
@@ -292,6 +400,7 @@ def summarize(rows: list[dict]) -> list[dict]:
         out = {
             "policy": policy,
             "episodes": n,
+            "successful_episodes": outcomes.count("success"),
             "success_coverage_rate_pct": 100.0 * outcomes.count("success") / n,
             "rrcr_pct": 100.0 * outcomes.count("rrcr") / n,
             "rwcr_pct": 100.0 * outcomes.count("rwcr") / n,
@@ -341,12 +450,7 @@ def plot_results(rows: list[dict], output_base: Path) -> None:
     axes[1, 0].set_xticks(x, policies, rotation=18); axes[1, 0].set_title("Episode outcomes (%)")
     axes[1, 0].set_ylim(0, 100)
     axes[1, 0].legend(fontsize=8); axes[1, 0].grid(axis="y", alpha=.25)
-    width = .24
-    for i, (field, label) in enumerate((("wall_collisions", "Wall"), ("robot_collisions", "Robot"),
-                                        ("human_collisions", "Human"))):
-        axes[1, 1].bar(x + (i - 1) * width, [np.mean([r[field] for r in g]) for g in groups], width, label=label)
-    axes[1, 1].set_xticks(x, policies, rotation=18); axes[1, 1].set_title("Collisions per episode")
-    axes[1, 1].legend(fontsize=8); axes[1, 1].grid(axis="y", alpha=.25)
+    box(axes[1, 1], "revisit_rate", "Already-covered cell entries (%)", 100)
     box(axes[1, 2], "all_collision_rate", "All-collision rate per robot-step", 100)
     for g, policy, color in zip(groups, policies, colors):
         y = np.asarray([r["coverage_rate"] for r in g]) * 100
@@ -366,12 +470,19 @@ def plot_results(rows: list[dict], output_base: Path) -> None:
                  for name in ("success", "rrcr", "rwcr", "rhcr", "tor")]
         times = np.asarray([r["completion_time_seconds"] for r in g], float)
         times = times[np.isfinite(times)]
-        avg_time = f"{times.mean():.1f}" if times.size else "--"
+        # A mean over an empty success set is undefined. State the reason in
+        # the table instead of leaving the cell blank or inventing a zero time.
+        avg_time = f"{times.mean():.1f}" if times.size else f"N/A (0/{len(g)})"
         table_data.append([p, *(f"{rate:.1f}%" for rate in rates), avg_time])
     table = axes[2, 2].table(cellText=table_data,
                              colLabels=["Policy", "Success/Cov", "RRCR", "RWCR",
-                                        "RHCR", "TOR", "Avg time (s)"], loc="center")
+                                        "RHCR", "TOR", "Avg success time (s)"], loc="center")
     table.auto_set_font_size(False); table.set_fontsize(6.5); table.scale(1, 1.5)
+    # Policy labels are considerably longer than the numeric summary values.
+    # Give their cells enough room while keeping the table within its subplot.
+    column_widths = (0.40, 0.13, 0.085, 0.085, 0.085, 0.085, 0.13)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_width(column_widths[column])
     axes[2, 2].set_title("Summary")
     fig.suptitle("mrCPP policy benchmark", fontsize=16)
     fig.savefig(output_base.with_suffix(".pdf"), bbox_inches="tight")
@@ -424,9 +535,17 @@ def main() -> None:
     started = time.time()
     rows = []
     for spec in specs:
-        rows.extend(evaluate_marl(spec, args.config, args.episodes, args.seed,
-                                  args.max_steps, args.batch_size, args.chunk_steps,
-                                  args.stochastic, device, args.progress_every))
+        if spec.kind == "bosco":
+            rows.extend(evaluate_bosco(
+                spec, args.config, args.episodes, args.seed, args.max_steps,
+                args.progress_every,
+            ))
+        else:
+            rows.extend(evaluate_marl(
+                spec, args.config, args.episodes, args.seed, args.max_steps,
+                args.batch_size, args.chunk_steps, args.stochastic, device,
+                args.progress_every,
+            ))
     raw_path = args.output_dir / "episodes.csv"
     write_csv(raw_path, rows, FIELDS)
     summary = summarize(rows)

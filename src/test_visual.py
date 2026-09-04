@@ -169,6 +169,12 @@ def _snapshot(env: MultiRobotCoverageEnv, state, want_lidar: bool,
         snap['bosco_goal_centers'] = controller.bosco_goal_centers(
             snap['coverage_grid'], snap['positions']
         )
+    if controller is not None and hasattr(controller, 'bosco_target_centers'):
+        # Plain BOSCO is a host-side planner and does not write its selected
+        # waypoints into EnvState.  Pull them from the planner itself instead
+        # of displaying EnvState.bosco_targets, which is merely initialised to
+        # the spawn positions in this mode.
+        snap['bosco_targets'] = controller.bosco_target_centers()
     return snap
 
 
@@ -282,17 +288,16 @@ def _draw_frame(
     positions = snap['positions']
     headings  = snap['headings']
 
-    # The star marks the next still-uncovered cell in each robot's remaining
-    # BOSCO tour.  It can differ from the dot when the immediate waypoint is a
-    # covered transit cell on the path to that pending coverage objective.
-    goal_centers = snap.get('bosco_goal_centers')
-    if goal_centers is not None:
+    # The star marks the immediate BOSCO waypoint. It can lie on an already
+    # covered transit cell while the robot travels towards pending coverage.
+    targets = snap['bosco_targets']
+    valid_targets = (np.all(np.isfinite(targets), axis=1)
+                     & (np.linalg.norm(targets - positions, axis=1) > 1e-5))
+    if targets is not None:
         star_outer = max(6, int(cell_px * 0.28))
         star_inner = max(3, int(star_outer * 0.45))
-        for i, goal in enumerate(goal_centers):
-            if not np.all(np.isfinite(goal)):
-                continue
-            gx, gy = _to_px(goal[0], goal[1], mh)
+        for i in np.flatnonzero(valid_targets):
+            gx, gy = _to_px(targets[i, 0], targets[i, 1], mh)
             color = _ROBOT_COLORS[i % len(_ROBOT_COLORS)]
             pygame.draw.polygon(
                 surface,
@@ -305,17 +310,19 @@ def _draw_frame(
                 _star_points((gx, gy), star_outer, star_inner),
             )
 
-    # -- Current BOSCO immediate waypoints --
+    # -- Next still-uncovered BOSCO cells --
     # Draw the dot after the star so both remain visible when the immediate
-    # waypoint is itself the next uncovered tour cell.
+    # waypoint is also the next pending coverage objective.
     target_radius = max(3, int(cell_px * 0.12))
-    targets = snap['bosco_targets']
-    valid_targets = np.linalg.norm(targets - positions, axis=1) > 1e-5
-    for i in np.flatnonzero(valid_targets):
-        tx, ty = _to_px(targets[i, 0], targets[i, 1], mh)
-        color = _ROBOT_COLORS[i % len(_ROBOT_COLORS)]
-        pygame.draw.circle(surface, COLORS['border'], (tx, ty), target_radius + 2)
-        pygame.draw.circle(surface, color, (tx, ty), target_radius)
+    goal_centers = snap.get('bosco_goal_centers')
+    if goal_centers is not None:
+        for i, goal in enumerate(goal_centers):
+            if not np.all(np.isfinite(goal)):
+                continue
+            tx, ty = _to_px(goal[0], goal[1], mh)
+            color = _ROBOT_COLORS[i % len(_ROBOT_COLORS)]
+            pygame.draw.circle(surface, COLORS['border'], (tx, ty), target_radius + 2)
+            pygame.draw.circle(surface, color, (tx, ty), target_radius)
 
     # -- Lidar rays (toggle with 'L') --
     if show_lidar and snap['lidar'].size:
@@ -632,6 +639,37 @@ class BoscoController:
         )
         state, rewards, terminated, truncated = self._step(state, jnp.asarray(actions))
         return state, rewards, terminated, truncated
+
+    def bosco_target_centers(self) -> np.ndarray:
+        """Current committed leg endpoint for each plain-BOSCO robot."""
+        targets = np.full((self.env.num_robots, 2), np.nan, dtype=np.float32)
+        for robot, tour in enumerate(self.expert.tours):
+            target_idx = int(self.expert.tgt[robot])
+            # tgt is a cursor into the mutable tour, not a flat cell id.  A
+            # value behind idx belongs to a retired/replanned leg and must not
+            # linger on screen during recovery.
+            if (not self.expert.done[robot]
+                    and self.expert.spin[robot] == 0
+                    and int(self.expert.idx[robot]) <= target_idx < len(tour)):
+                targets[robot] = self.expert.graph.centers[tour[target_idx]]
+        return targets
+
+    def bosco_goal_centers(self, coverage_grid: np.ndarray,
+                           positions: np.ndarray) -> np.ndarray:
+        """First still-uncovered cell in each robot's live BOSCO plan."""
+        del positions  # kept for the same snapshot hook used by MAPPO
+        goals = np.full((self.env.num_robots, 2), np.nan, dtype=np.float32)
+        covered = np.asarray(coverage_grid).reshape(-1) > 0.5
+        centers = self.expert.graph.centers
+        for robot, tour in enumerate(self.expert.tours):
+            start = int(self.expert.idx[robot])
+            remaining = np.asarray(tour[start:], dtype=np.int64)
+            if remaining.size == 0:
+                continue
+            pending = remaining[~covered[remaining]]
+            if pending.size:
+                goals[robot] = centers[pending[0]]
+        return goals
 
 
 def run_episode(
